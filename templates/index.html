@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>App Ads.txt Checker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex items-center justify-center h-screen font-sans">
+    <div class="bg-white p-8 rounded-lg shadow-lg w-full max-w-md">
+        <h1 class="text-2xl font-bold mb-6 text-center text-gray-700">App Ads.txt Checker</h1>
+        <form action="/upload" method="post" enctype="multipart/form-data" id="upload-form">
+            <div class="mb-4">
+                <label for="apps_file" class="block text-gray-700 text-sm font-semibold mb-2">1. Upload Apps to Check (.csv)</label>
+                <input type="file" name="apps_file" id="apps_file" accept=".csv" required
+                       class="w-full px-3 py-2 border rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div class="mb-6">
+                <label for="lines_file" class="block text-gray-700 text-sm font-semibold mb-2">2. Upload Lines to Check (.txt)</label>
+                <input type="file" name="lines_file" id="lines_file" accept=".txt" required
+                       class="w-full px-3 py-2 border rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <button type="submit" id="submit-btn"
+                    class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition duration-300">
+                Process Files and Download Results
+            </button>
+        </form>
+        <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
+            <p>Processing... This may take a few moments. Your download will start automatically.</p>
+        </div>
+    </div>
+    <script>
+        document.getElementById('upload-form').addEventListener('submit', function() {
+            document.getElementById('submit-btn').disabled = true;
+            document.getElementById('submit-btn').innerText = 'Processing...';
+            document.getElementById('loading-message').classList.remove('hidden');
+        });
+    </script>
+</body>
+</html>

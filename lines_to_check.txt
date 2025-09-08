@@ -1,0 +1,15 @@
+thejungletechnology.com, 161027, DIRECT
+pixelverge.com, 161027, DIRECT
+google.com, pub-9911740406682987, RESELLER, f08c47fec0942fa0
+rubiconproject.com, 27854, RESELLER, 0bfd66d529a55807
+lijit.com, 560797, RESELLER, fafdf38b16bf6b2b #SOVRN
+inmobi.com, b01aa06531c543d8a5fb9982f60afb00, RESELLER, 83e75a7ae333ca9d
+rubiconproject.com, 17960, RESELLER, 0bfd66d529a55807
+smartadserver.com, 4926, RESELLER, 060d053dcf45cbf3
+pubmatic.com, 137711, RESELLER, 5d62403b186f2ace
+appnexus.com, 1019, RESELLER, f5ab79cb980f11d1
+video.unrulymedia.com, 2444764291, RESELLER
+openx.com, 538959099, RESELLER, 6a698e2ec38604c6
+uis.mobfox.com, 2444, RESELLER, 5529a3d1f59865be
+pubmatic.com, 156451, RESELLER, 5d62403b186f2ace
+improvedigital.com, 2417, RESELLER
