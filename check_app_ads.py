@@ -135,5 +135,5 @@ def upload_files():
 
 if __name__ == '__main__':
     # Runs the Flask application
-    app.run(debug=True)
+    app.run(debug=False)
 
