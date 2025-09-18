@@ -1,4 +1,5 @@
 pandas
 aiohttp
 flask
-gunicorn
+requests
+beautifulsoup4
