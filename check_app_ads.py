@@ -4,7 +4,7 @@ import pandas as pd
 import re
 import io
 from datetime import datetime
-from flask import Flask, render_template, request, send_file, session, redirect, url_for
+from flask import Flask, render_template, request, send_file, session, redirect, url_for, send_from_directory
 from flask_session import Session
 import time
 import requests
@@ -405,6 +405,24 @@ def logout():
     """Clears user session and redirects to login."""
     session.clear()
     return redirect(url_for('login'))
+
+@app.route('/healthz')
+def healthz():
+    """Simple health check endpoint for Cloud Run load balancer."""
+    return "ok", 200
+
+@app.route('/favicon.ico')
+def favicon():
+    """Serve favicon to avoid 503s from default /favicon.ico requests."""
+    try:
+        return send_from_directory(
+            os.path.join(app.root_path, 'static'),
+            'JT_logo.png',
+            mimetype='image/png'
+        )
+    except Exception:
+        # Return empty 204 if asset missing, so LB doesn't treat as error
+        return ('', 204)
 
 @app.route('/', methods=['GET'])
 def index():
