@@ -4,3 +4,6 @@ flask
 requests
 beautifulsoup4
 gunicorn
+authlib
+flask-session
+python-dotenv

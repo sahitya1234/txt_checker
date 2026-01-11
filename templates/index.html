@@ -3,37 +3,170 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>App Ads.txt Checker</title>
+    <title>Jungle Technology - Internal Tools</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-gray-100 flex items-center justify-center h-screen font-sans">
-    <div class="bg-white p-8 rounded-lg shadow-lg w-full max-w-md">
-        <h1 class="text-2xl font-bold mb-6 text-center text-gray-700">App Ads.txt Checker</h1>
-        <form action="/upload" method="post" enctype="multipart/form-data" id="upload-form">
-            <div class="mb-4">
-                <label for="apps_file" class="block text-gray-700 text-sm font-semibold mb-2">1. Upload Apps to Check (.csv)</label>
-                <input type="file" name="apps_file" id="apps_file" accept=".csv" required
-                       class="w-full px-3 py-2 border rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+<body class="bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 min-h-screen">
+    <!-- Navigation Bar -->
+    <nav class="bg-white bg-opacity-95 backdrop-blur-sm shadow-lg sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-6 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <img src="{{ url_for('static', filename='JT_logo.png') }}" alt="Jungle Technology Logo" class="h-10">
+                <span class="text-xl font-bold text-gray-800">Jungle Technology</span>
             </div>
-            <div class="mb-6">
-                <label for="lines_file" class="block text-gray-700 text-sm font-semibold mb-2">2. Upload Lines to Check (.txt)</label>
-                <input type="file" name="lines_file" id="lines_file" accept=".txt" required
-                       class="w-full px-3 py-2 border rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            {% if session.get('user') %}
+            <div class="flex items-center gap-4">
+                <div class="text-right">
+                    <p class="text-sm font-semibold text-gray-700">{{ session['user']['name'] }}</p>
+                    <p class="text-xs text-gray-500">{{ session['user']['email'] }}</p>
+                </div>
+                {% if session['user']['picture'] %}
+                <img src="{{ session['user']['picture'] }}" alt="Profile" class="w-10 h-10 rounded-full border-2 border-blue-500">
+                {% endif %}
+                <a href="{{ url_for('logout') }}" class="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition duration-200">
+                    Logout
+                </a>
             </div>
-            <button type="submit" id="submit-btn"
-                    class="w-full bg-blue-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-blue-700 transition duration-300">
-                Process Files and Download Results
-            </button>
-        </form>
-        <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
-            <p>Processing... This may take a few moments. Your download will start automatically.</p>
+            {% endif %}
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="min-h-[calc(100vh-80px)] py-12 px-4">
+        <div class="max-w-7xl mx-auto">
+            <!-- Header Section -->
+            <div class="text-center mb-16">
+                <h1 class="text-5xl font-bold text-white mb-4">Internal Tools Suite</h1>
+                <p class="text-xl text-gray-300">Powerful utilities to streamline your workflow</p>
+                <p class="text-xl text-gray-300">Tooools Maaaaadi Tooooools</p>
+            </div>
+
+            <!-- Products Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 mb-12">
+                <!-- Product 1: App Ads.txt Checker (Active) -->
+                <div class="group relative bg-white bg-opacity-10 backdrop-blur-md rounded-2xl p-8 hover:bg-opacity-20 transition duration-300 border border-white border-opacity-20 hover:border-opacity-40 cursor-pointer shadow-xl hover:shadow-2xl hover:-translate-y-2">
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-t-2xl"></div>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-2xl font-bold text-white">App Ads.txt Checker</h2>
+                        <span class="bg-green-500 text-white text-xs font-bold px-3 py-1 rounded-full">Active</span>
+                    </div>
+                    <p class="text-gray-300 mb-6">Validate app-ads.txt files across your app store listings. Check for compliance and verify ad network declarations.</p>
+                    <div class="mb-6">
+                        <p class="text-sm text-gray-400 mb-2">Features:</p>
+                        <ul class="text-sm text-gray-300 space-y-1">
+                            <li>✓ Batch file processing</li>
+                            <li>✓ Real-time validation</li>
+                            <li>✓ CSV export results</li>
+                        </ul>
+                    </div>
+                    <button onclick="document.getElementById('tool-selector').value = 'checker'; switchTool('checker')" 
+                            class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold py-3 rounded-lg hover:from-blue-700 hover:to-cyan-700 transition duration-200">
+                        Launch Tool →
+                    </button>
+                </div>
+
+                <!-- Product 2: Coming Soon -->
+                <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl opacity-75">
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-purple-500 to-pink-500 rounded-t-2xl"></div>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-2xl font-bold text-white">Analytics Dashboard</h2>
+                        <span class="bg-yellow-500 text-gray-900 text-xs font-bold px-3 py-1 rounded-full">Coming Soon</span>
+                    </div>
+                    <p class="text-gray-400 mb-6">Comprehensive analytics and reporting for your app performance metrics across multiple platforms.</p>
+                    <div class="mb-6">
+                        <p class="text-sm text-gray-500 mb-2">Features:</p>
+                        <ul class="text-sm text-gray-400 space-y-1">
+                            <li>✓ Real-time dashboards</li>
+                            <li>✓ Custom reports</li>
+                            <li>✓ Data exports</li>
+                        </ul>
+                    </div>
+                    <button disabled class="w-full bg-gray-600 text-gray-300 font-bold py-3 rounded-lg cursor-not-allowed opacity-50">
+                        Coming Soon
+                    </button>
+                </div>
+
+                <!-- Product 3: Coming Soon -->
+                <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl opacity-75">
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-teal-500 rounded-t-2xl"></div>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-2xl font-bold text-white">Store Optimizer</h2>
+                        <span class="bg-yellow-500 text-gray-900 text-xs font-bold px-3 py-1 rounded-full">Coming Soon</span>
+                    </div>
+                    <p class="text-gray-400 mb-6">Optimize your app store listings with AI-powered suggestions for descriptions, keywords, and metadata.</p>
+                    <div class="mb-6">
+                        <p class="text-sm text-gray-500 mb-2">Features:</p>
+                        <ul class="text-sm text-gray-400 space-y-1">
+                            <li>✓ AI optimization</li>
+                            <li>✓ Keyword analysis</li>
+                            <li>✓ Competitor tracking</li>
+                        </ul>
+                    </div>
+                    <button disabled class="w-full bg-gray-600 text-gray-300 font-bold py-3 rounded-lg cursor-not-allowed opacity-50">
+                        Coming Soon
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tool Panel (Hidden by default, shows when tool selected) -->
+            <div id="tool-panel" class="hidden bg-white rounded-2xl shadow-2xl p-8 max-w-2xl mx-auto">
+                <button onclick="closeTool()" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+                <h2 class="text-3xl font-bold text-gray-800 mb-6">App Ads.txt Checker</h2>
+                
+                <form action="/upload" method="post" enctype="multipart/form-data" id="upload-form">
+                    <div class="mb-4">
+                        <label for="apps_file" class="block text-gray-700 text-sm font-semibold mb-2">1. Upload Apps to Check (.csv)</label>
+                        <input type="file" name="apps_file" id="apps_file" accept=".csv" required
+                               class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg text-gray-700 focus:outline-none focus:border-blue-500 transition">
+                    </div>
+                    <div class="mb-6">
+                        <label for="lines_file" class="block text-gray-700 text-sm font-semibold mb-2">2. Upload Lines to Check (.txt)</label>
+                        <input type="file" name="lines_file" id="lines_file" accept=".txt" required
+                               class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg text-gray-700 focus:outline-none focus:border-blue-500 transition">
+                    </div>
+                    <button type="submit" id="submit-btn"
+                            class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold py-3 px-4 rounded-lg hover:from-blue-700 hover:to-cyan-700 transition duration-300">
+                        Process Files and Download Results
+                    </button>
+                </form>
+                <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
+                    <p>Processing... This may take a few moments. Your download will start automatically.</p>
+                </div>
+            </div>
+
+            <input type="hidden" id="tool-selector" value="">
         </div>
     </div>
+
     <script>
-        document.getElementById('upload-form').addEventListener('submit', function() {
+        function switchTool(toolName) {
+            document.getElementById('tool-panel').classList.remove('hidden');
+            // Smooth scroll to tool panel
+            setTimeout(() => {
+                document.getElementById('tool-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
+        }
+
+        function closeTool() {
+            document.getElementById('tool-panel').classList.add('hidden');
+            document.getElementById('upload-form').reset();
+            document.getElementById('loading-message').classList.add('hidden');
+            document.getElementById('submit-btn').disabled = false;
+            document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
+        }
+
+        document.getElementById('upload-form').addEventListener('submit', function(e) {
             document.getElementById('submit-btn').disabled = true;
             document.getElementById('submit-btn').innerText = 'Processing...';
             document.getElementById('loading-message').classList.remove('hidden');
+
+            // Reset button, message, and form after 3 seconds (file download should complete by then)
+            setTimeout(function() {
+                document.getElementById('submit-btn').disabled = false;
+                document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
+                document.getElementById('loading-message').classList.add('hidden');
+                document.getElementById('upload-form').reset();
+            }, 3000);
         });
     </script>
 </body>

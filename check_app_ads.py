@@ -4,13 +4,53 @@ import pandas as pd
 import re
 import io
 from datetime import datetime
-from flask import Flask, render_template, request, send_file
+from flask import Flask, render_template, request, send_file, session, redirect, url_for
+from flask_session import Session
 import time
 import requests
 from bs4 import BeautifulSoup
+import os
+import random
+from functools import wraps
+from authlib.integrations.flask_client import OAuth
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize the Flask application
 app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-key-change-in-prod')
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+
+# Initialize OAuth
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=os.environ.get('GOOGLE_CLIENT_ID'),
+    client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    }
+)
+
+ALLOWED_EMAIL_DOMAIN = os.environ.get('ALLOWED_EMAIL_DOMAIN', 'thejungletechnology.com')
+
+# --- Auth Decorators & Helpers ---
+def login_required(f):
+    """Decorator to check if user is logged in and has valid company email."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def is_company_email(email):
+    """Check if email ends with the allowed company domain."""
+    return email.endswith(f"@{ALLOWED_EMAIL_DOMAIN}")
 
 # --- URL Construction Logic ---
 def get_store_url(bundle_id):
@@ -50,11 +90,26 @@ def get_support_website(store_url, store_type='play_store'):
     """
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         }
-        
-        response = requests.get(store_url, headers=headers)
-        response.raise_for_status()
+
+        # Simple retry loop for store page fetch (to handle transient errors and 429)
+        max_retries = 3
+        base_delay = 0.5
+        backoff = 2.0
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(store_url, headers=headers, timeout=10)
+                response.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                if attempt == max_retries - 1:
+                    raise
+                sleep_for = base_delay * (backoff ** attempt) + random.uniform(0, 0.25)
+                time.sleep(sleep_for)
         
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -171,7 +226,41 @@ def get_app_ads_url(bundle_id):
         return None
 
 # --- Core Logic ---
-SEMAPHORE = asyncio.Semaphore(100)
+
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BASE_DELAY = 0.5
+DEFAULT_BACKOFF = 2.0
+
+async def fetch_text_with_retries(session, url, timeout=10,
+                                  max_retries=DEFAULT_MAX_RETRIES,
+                                  base_delay=DEFAULT_BASE_DELAY,
+                                  backoff=DEFAULT_BACKOFF):
+    """Fetch URL text with retries and exponential backoff.
+    Returns (text, error_message). text=None on failure.
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return await resp.text(), None
+                elif resp.status in RETRYABLE_STATUSES:
+                    last_error = f"HTTP {resp.status}"
+                    # backoff and retry
+                else:
+                    return None, f"HTTP {resp.status}"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_error = str(e)
+            # backoff and retry
+
+        # sleep before next attempt (except after last)
+        if attempt < max_retries - 1:
+            sleep_for = base_delay * (backoff ** attempt) + random.uniform(0, 0.25)
+            await asyncio.sleep(sleep_for)
+
+    # exhausted
+    return None, (last_error or "Unknown error")
 
 def clean_line(line):
     """
@@ -189,29 +278,34 @@ def load_lines_from_memory(file_content):
     lines = {clean_line(line) for line in file_content.splitlines() if line.strip()}
     return lines
 
-async def fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check):
+async def fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check, semaphore, url_cache):
     """Fetches a URL and checks for matching lines using a set for speed."""
-    async with SEMAPHORE:
+    async with semaphore:
         result = {"Bundle ID": bundle_id, "AppAdsURL": url}
         try:
             # If no URL is provided, try to get it from the store
-            if not url or pd.isna(url) or not isinstance(url, str):
-                url = get_app_ads_url(bundle_id)
+            if (not url or pd.isna(url) or not isinstance(url, str)):
+                # try cache first
+                if url_cache is not None and bundle_id in url_cache:
+                    url = url_cache[bundle_id]
+                else:
+                    url = get_app_ads_url(bundle_id)
+                    if url_cache is not None:
+                        url_cache[bundle_id] = url
                 result["AppAdsURL"] = url if url else ""
                 
             if url:  # Only proceed if we have a URL
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        content = await resp.text()
-                        downloaded_lines_set = {clean_line(line) for line in content.splitlines()}
-                        result["TXT Found"] = "Yes"
-                        matches = lines_to_check.intersection(downloaded_lines_set)
-                        for check_line in ordered_lines_to_check:
-                            result[f"{check_line}"] = check_line in matches
-                        result["Error"] = "-"
-                    else:
-                        result["TXT Found"] = "No"
-                        result["Error"] = f"HTTP {resp.status}"
+                content, err = await fetch_text_with_retries(session, url, timeout=10)
+                if content is not None:
+                    downloaded_lines_set = {clean_line(line) for line in content.splitlines()}
+                    result["TXT Found"] = "Yes"
+                    matches = lines_to_check.intersection(downloaded_lines_set)
+                    for check_line in ordered_lines_to_check:
+                        result[f"{check_line}"] = check_line in matches
+                    result["Error"] = "-"
+                else:
+                    result["TXT Found"] = "No"
+                    result["Error"] = err or "Fetch failed"
             else:
                 result["TXT Found"] = "No"
                 result["Error"] = "No app-ads.txt URL found"
@@ -233,12 +327,32 @@ async def process_files_async(apps_df, lines_to_check):
     column_headers = ["Bundle ID", "AppAdsURL", "TXT Found", "Error"] + \
                      [f"{line}" for line in ordered_lines_to_check]
 
-    async with aiohttp.ClientSession() as session:
+    # Configurable concurrency via env var, default 100
+    try:
+        concurrency = int(os.environ.get("APP_CONCURRENCY", "100"))
+        concurrency = max(10, min(concurrency, 200))
+    except Exception:
+        concurrency = 100
+
+    # Create per-run semaphore bound to this event loop
+    semaphore = asyncio.Semaphore(concurrency)
+
+    # Per-run URL cache to avoid re-scraping duplicated bundle IDs
+    url_cache = {}
+
+    timeout = aiohttp.ClientTimeout(total=20, sock_connect=10, sock_read=10)
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=10, ttl_dns_cache=300)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        'Accept-Encoding': 'gzip, deflate',
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
         tasks = []
         for _, row in apps_df.iterrows():
             bundle_id = row.get("Bundle ID")
             url = row.get("AppAdsURL")
-            tasks.append(fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check))
+            tasks.append(fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check, semaphore, url_cache))
 
         for future in asyncio.as_completed(tasks):
             res = await future
@@ -250,12 +364,57 @@ async def process_files_async(apps_df, lines_to_check):
 # --- Flask Routes ---
 # This section defines the web page and the file handling logic.
 
+@app.route('/login')
+def login():
+    """Renders the login page with a button to start Google OAuth."""
+    return render_template('login.html')
+
+@app.route('/login/google')
+def login_google():
+    """Redirects to Google OAuth consent screen."""
+    redirect_uri = url_for('authorize', _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/authorize')
+def authorize():
+    """OAuth callback route. Validates token and checks company email."""
+    token = google.authorize_access_token()
+    user_info = token.get('userinfo')
+    
+    if not user_info:
+        return "Failed to retrieve user info.", 403
+    
+    email = user_info.get('email', '').lower()
+    
+    # Check if email is from company domain
+    if not is_company_email(email):
+        return f"Access denied. You must use a company email (@{ALLOWED_EMAIL_DOMAIN}). Your email: {email}", 403
+    
+    # Store user info in session
+    session['user'] = {
+        'email': email,
+        'name': user_info.get('name', ''),
+        'picture': user_info.get('picture', '')
+    }
+    session.permanent = True
+    
+    return redirect(url_for('index'))
+
+@app.route('/logout')
+def logout():
+    """Clears user session and redirects to login."""
+    session.clear()
+    return redirect(url_for('login'))
+
 @app.route('/', methods=['GET'])
 def index():
     """Renders the main upload page."""
+    if 'user' not in session:
+        return redirect(url_for('login'))
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_files():
     """Handles file uploads, processes them, and returns the result CSV."""
     if 'apps_file' not in request.files or 'lines_file' not in request.files:
@@ -304,6 +463,7 @@ def upload_files():
         return f"An error occurred: {e}", 500
 
 if __name__ == '__main__':
-    # Runs the Flask application
-    app.run(debug=False)
+    # Runs the Flask application on a port that avoids macOS AirPlay conflicts (use 8000 by default)
+    port = int(os.environ.get('PORT', os.environ.get('FLASK_RUN_PORT', 8000)))
+    app.run(host='127.0.0.1', port=port, debug=False)
 

@@ -4,19 +4,23 @@ A Flask web application that checks for the presence of specific lines in app-ad
 
 ## Features
 - 🌐 **Web Interface**: Easy-to-use web interface for file uploads
-- ⚡ **Async Processing**: Fast concurrent checking of multiple URLs
-- 📊 **Bulk Analysis**: Check any number of app-ads.txt URLs at once
+- ⚡ **Async Processing**: Fast concurrent checking with retries and exponential backoff
+- 📊 **Bulk Analysis**: Check thousands of app-ads.txt URLs at once (tested with 10k+)
 - 📁 **Flexible Input**: Upload custom lines to check via text file
 - 📈 **Detailed Reports**: CSV output with match results for each line
 - 🎨 **Modern UI**: Clean, responsive interface using Tailwind CSS
+- 🔐 **Google OAuth**: Secure company email authentication via Google SSO
+- 🛡️ **Robust Error Handling**: Automatic retries, rate-limit backoff, per-host connection limits
 
 ## Project Structure
 ```
 text_scrapper_JT/
-├── check_app_ads.py          # Main Flask application
+├── check_app_ads.py          # Main Flask application with OAuth
 ├── requirements.txt          # Python dependencies
+├── .env.example              # Environment variables template
+├── OAUTH_SETUP.md            # Detailed OAuth setup guide
 ├── templates/                # HTML templates
-│   └── index.html           # Main page template
+│   └── index.html           # Main page template (with auth UI)
 └── static/                  # Static files (CSS, JS)
     └── style.css            # Custom styles
 ```
@@ -24,10 +28,26 @@ text_scrapper_JT/
 ## Requirements
 - Python 3.7+
 - Flask
+- Flask-Session (for session management)
 - pandas
 - aiohttp
+- authlib (for Google OAuth)
 
 Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Setup
+
+### 1. Configure Google OAuth
+Follow the detailed steps in [OAUTH_SETUP.md](OAUTH_SETUP.md) to:
+- Create a Google Cloud project
+- Enable Google+ API
+- Generate OAuth 2.0 credentials
+- Create a `.env` file with your credentials
+
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
@@ -42,11 +62,16 @@ python check_app_ads.py
 ### 2. Access the Web Interface
 Open your browser and go to: `http://localhost:5000`
 
-### 3. Upload Files
+### 3. Google Login
+- You'll be redirected to Google OAuth login
+- Login with your company email (`@thejungletechnology.com`)
+- If your email domain doesn't match, you'll get an access denied message
+
+### 4. Upload Files
 - **Apps CSV**: Upload a CSV file with Bundle IDs and AppAdsURL columns
 - **Lines to Check**: Upload a text file containing the lines you want to check for
 
-### 4. Download Results
+### 5. Download Results
 The application will process your files and automatically download a timestamped CSV report.
 
 ## Input File Formats
