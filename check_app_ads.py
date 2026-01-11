@@ -5,6 +5,7 @@ import re
 import io
 from datetime import datetime
 from flask import Flask, render_template, request, send_file, session, redirect, url_for, send_from_directory
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_session import Session
 import time
 import requests
@@ -22,6 +23,8 @@ load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-key-change-in-prod')
 app.config['SESSION_TYPE'] = 'filesystem'
+app.config['PREFERRED_URL_SCHEME'] = 'https'
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 Session(app)
 
 # Initialize OAuth
@@ -372,7 +375,7 @@ def login():
 @app.route('/login/google')
 def login_google():
     """Redirects to Google OAuth consent screen."""
-    redirect_uri = url_for('authorize', _external=True)
+    redirect_uri = url_for('authorize', _external=True, _scheme='https')
     return google.authorize_redirect(redirect_uri)
 
 @app.route('/authorize')
