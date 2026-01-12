@@ -44,6 +44,9 @@
 
             <!-- Products Grid -->
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 mb-12">
+                    <!-- Product 1: Active Tool -->
+                    <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl hover:shadow-2xl transition duration-300">
+                        <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-600 to-cyan-600 rounded-t-2xl"></div>
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-2xl font-bold text-white">App Ads.txt Checker</h2>
                         <span class="bg-green-500 text-white text-xs font-bold px-3 py-1 rounded-full">Active</span>
@@ -325,31 +328,47 @@ bidstack.com</pre>
             document.getElementById('submit-btn').innerText = 'Processing...';
             document.getElementById('loading-message').classList.remove('hidden');
 
-            // Listen for download completion
-            let downloadDetected = false;
+            // Set a unique cookie value before submission
+            const downloadToken = new Date().getTime();
+            document.cookie = 'downloadToken=' + downloadToken + '; path=/';
             
-            // Method 1: Detect when download starts (by monitoring visibility change)
-            document.addEventListener('visibilitychange', function handleVisibilityChange() {
-                if (document.hidden === false && !downloadDetected) {
-                    downloadDetected = true;
-                    hideLoader();
-                    document.removeEventListener('visibilitychange', handleVisibilityChange);
+            // Poll for download completion by checking if server set the cookie
+            let attempts = 0;
+            const maxAttempts = 1200; // 10 minutes (1200 * 500ms = 600s)
+            
+            const checkDownloadInterval = setInterval(function() {
+                attempts++;
+                
+                // Check if download cookie was set by server
+                const cookies = document.cookie.split(';');
+                let downloadStarted = false;
+                
+                for (let cookie of cookies) {
+                    if (cookie.trim().startsWith('download_started=')) {
+                        downloadStarted = true;
+                        break;
+                    }
                 }
-            });
-            
-            // Method 2: Set a longer timeout as fallback (max 10 minutes for large jobs)
-            const maxTimeout = setTimeout(function() {
-                if (!downloadDetected) {
+                
+                // If download started or max attempts reached
+                if (downloadStarted || attempts >= maxAttempts) {
+                    clearInterval(checkDownloadInterval);
+                    
+                    // Clean up the cookie
+                    document.cookie = 'download_started=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
+                    
+                    // Hide loader
                     hideLoader();
+                    
+                    // Reset form
+                    setTimeout(function() {
+                        document.getElementById('submit-btn').disabled = false;
+                        document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
+                        document.getElementById('loading-message').classList.add('hidden');
+                        document.getElementById('upload-form').reset();
+                    }, 1500);
                 }
-                document.getElementById('submit-btn').disabled = false;
-                document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
-                document.getElementById('loading-message').classList.add('hidden');
-                document.getElementById('upload-form').reset();
-            }, 600000); // 10 minutes max
-            
-            // Store timeout ID for potential cleanup
-            window.uploadTimeout = maxTimeout;
+            }, 500); // Check every 500ms
         });
     </script>
 </body>

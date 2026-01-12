@@ -7,3 +7,4 @@ gunicorn
 authlib
 flask-session
 python-dotenv
+openpyxl

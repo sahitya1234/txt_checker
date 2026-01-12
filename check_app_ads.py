@@ -479,12 +479,18 @@ def upload_files():
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         dynamic_filename = f"results_{timestamp}.csv"
 
-        return send_file(
+        # Create response with download cookie
+        response = make_response(send_file(
             mem_file,
             as_attachment=True,
             download_name=dynamic_filename,
             mimetype='text/csv'
-        )
+        ))
+        
+        # Set cookie to signal download has started
+        response.set_cookie('download_started', 'true', max_age=10)
+        
+        return response
 
     except Exception as e:
         return f"An error occurred: {e}", 500
