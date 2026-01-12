@@ -302,7 +302,13 @@ async def fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines
                 if content is not None:
                     downloaded_lines_set = {clean_line(line) for line in content.splitlines()}
                     result["TXT Found"] = "Yes"
-                    matches = lines_to_check.intersection(downloaded_lines_set)
+                    # Check if any line contains the search term (substring matching)
+                    matches = set()
+                    for check_line in lines_to_check:
+                        for downloaded_line in downloaded_lines_set:
+                            if check_line in downloaded_line:
+                                matches.add(check_line)
+                                break
                     for check_line in ordered_lines_to_check:
                         result[f"{check_line}"] = check_line in matches
                     result["Error"] = "-"
