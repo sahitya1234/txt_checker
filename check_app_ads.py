@@ -336,12 +336,12 @@ async def process_files_async(apps_df, lines_to_check):
     column_headers = ["Bundle ID", "AppAdsURL", "TXT Found", "Error"] + \
                      [f"{line}" for line in ordered_lines_to_check]
 
-    # Configurable concurrency via env var, default 100
+    # Configurable concurrency via env var, default 50 (lower for large jobs)
     try:
-        concurrency = int(os.environ.get("APP_CONCURRENCY", "100"))
+        concurrency = int(os.environ.get("APP_CONCURRENCY", "50"))
         concurrency = max(10, min(concurrency, 200))
     except Exception:
-        concurrency = 100
+        concurrency = 50
 
     # Create per-run semaphore bound to this event loop
     semaphore = asyncio.Semaphore(concurrency)

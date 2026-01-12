@@ -17,4 +17,4 @@ ENV PORT=8080
 EXPOSE 8080
 
 # Run with gunicorn
-CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 300 check_app_ads:app
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 600 check_app_ads:app
