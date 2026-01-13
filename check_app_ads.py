@@ -6,7 +6,6 @@ import io
 from datetime import datetime
 from flask import Flask, render_template, request, send_file, session, redirect, url_for, send_from_directory, make_response
 from werkzeug.middleware.proxy_fix import ProxyFix
-from flask_session import Session
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -22,10 +21,15 @@ load_dotenv()
 # Initialize the Flask application
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-key-change-in-prod')
-app.config['SESSION_TYPE'] = 'filesystem'
+# Remove filesystem sessions - use Flask's built-in secure cookies instead
+app.config['SESSION_TYPE'] = 'null'  # or just remove this line
 app.config['PREFERRED_URL_SCHEME'] = 'https'
+app.config['SESSION_COOKIE_SECURE'] = True  # Only HTTPS
+app.config['SESSION_COOKIE_HTTPONLY'] = True  # XSS protection
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+app.config['PERMANENT_SESSION_LIFETIME'] = 3600  # 1 hour
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-Session(app)
+# Remove: Session(app)  # Not needed for cookie sessions
 
 # Initialize OAuth
 oauth = OAuth(app)
