@@ -14,9 +14,555 @@ import random
 from functools import wraps
 from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
+import logging
+import sys
+import psutil
+import os as os_module
+import csv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Configure logging for Cloud Run
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
+# --- Complete App Ads.txt Analyzer Class ---
+class CompleteAdsTxtAnalyzer:
+    def __init__(self, android_workers=50, ios_workers=50, ios_delay=0.5, verification_workers=50):
+        # Scraping settings
+        self.android_workers = android_workers
+        self.ios_workers = ios_workers
+        self.ios_delay = ios_delay
+        self.verification_workers = verification_workers
+        
+        # Statistics
+        self.scraping_stats = {
+            'total_apps': 0,
+            'android_apps': 0,
+            'ios_apps': 0,
+            'android_success': 0,
+            'ios_success': 0,
+            'android_retries': 0,
+            'ios_rate_limited': 0,
+            'failed': 0
+        }
+        
+        self.verification_stats = {
+            'total_urls': 0,
+            'accessible': 0,
+            'inaccessible': 0,
+            'contains_all_lines': 0,
+            'missing_some_lines': 0,
+            'errors': 0
+        }
+        
+        # Android User Agents
+        self.android_user_agents = [
+            'Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 12; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Mobile Safari/537.36',
+            'Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Mobile Safari/537.36'
+        ]
+        
+        self.android_regions = ['us', 'gb', 'ca', 'au', 'in']
+    
+    def load_bundle_ids_from_df(self, apps_df):
+        """Load and separate bundle IDs by platform from a DataFrame"""
+        try:
+            android_bundles = []
+            ios_bundles = []
+            
+            # Normalize column names
+            for col in apps_df.columns:
+                lower_col = col.lower().strip()
+                if 'bundle' in lower_col and 'id' in lower_col:
+                    bundle_column = col
+                    break
+            else:
+                logger.error("No bundle ID column found in DataFrame")
+                return [], []
+            
+            logger.info(f"Using column: '{bundle_column}'")
+            
+            for _, row in apps_df.iterrows():
+                bundle_id = str(row.get(bundle_column, '')).strip()
+                if bundle_id and bundle_id.lower() not in ['', 'nan', 'none']:
+                    if bundle_id.isdigit():
+                        ios_bundles.append(bundle_id)
+                    else:
+                        android_bundles.append(bundle_id)
+            
+            logger.info(f"Loaded bundle IDs from DataFrame")
+            logger.info(f"Distribution: Android: {len(android_bundles):,} | iOS: {len(ios_bundles):,}")
+            
+            return android_bundles, ios_bundles
+            
+        except Exception as e:
+            logger.error(f"Error loading bundle IDs: {e}")
+            return [], []
+    
+    async def scrape_android_app(self, session, bundle_id, max_retries=3):
+        """Scrape Android app for developer website URL"""
+        for retry_count in range(max_retries + 1):
+            try:
+                region = random.choice(self.android_regions)
+                user_agent = random.choice(self.android_user_agents)
+                
+                url = f"https://play.google.com/store/apps/details?id={bundle_id}&gl={region}&hl=en"
+                
+                headers = {
+                    'User-Agent': user_agent,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
+                }
+                
+                timeout = aiohttp.ClientTimeout(total=3)
+                
+                async with session.get(url, headers=headers, timeout=timeout) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        
+                        # Look for developer website
+                        developer_url = None
+                        element = soup.select_one('a.Si6A0c.RrSxVb')
+                        if element and element.get('href'):
+                            developer_url = element.get('href')
+                        
+                        # Fallback selector
+                        if not developer_url:
+                            elements = soup.select('a[href*="http"]')
+                            for elem in elements:
+                                href = elem.get('href', '')
+                                if (href.startswith('http') and 
+                                    not 'play.google.com' in href and
+                                    not 'support.google.com' in href):
+                                    developer_url = href
+                                    break
+                        
+                        if developer_url:
+                            # Add /app-ads.txt to the URL
+                            if not developer_url.endswith('/'):
+                                developer_url += '/'
+                            developer_url += 'app-ads.txt'
+                            
+                            self.scraping_stats['android_success'] += 1
+                            return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': developer_url, 'status': 'success'}
+                        else:
+                            return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': 'no_website_found'}
+                    
+                    elif response.status == 404:
+                        return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': 'not_found'}
+                    
+                    else:
+                        if retry_count < max_retries:
+                            await asyncio.sleep(1 * (retry_count + 1))
+                            self.scraping_stats['android_retries'] += 1
+                            continue
+                        return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': f'http_error_{response.status}'}
+                        
+            except asyncio.TimeoutError:
+                if retry_count < max_retries:
+                    await asyncio.sleep(1 * (retry_count + 1))
+                    self.scraping_stats['android_retries'] += 1
+                    continue
+                return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': 'timeout'}
+                
+            except Exception as e:
+                if retry_count < max_retries:
+                    await asyncio.sleep(1 * (retry_count + 1))
+                    self.scraping_stats['android_retries'] += 1
+                    continue
+                return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': f'error: {str(e)[:30]}'}
+    
+    async def scrape_ios_app_async(self, session, bundle_id, max_retries=2):
+        """Scrape iOS app asynchronously for developer website URL with retry logic"""
+        for retry in range(max_retries + 1):
+            try:
+                url = f"https://apps.apple.com/in/app/id{bundle_id}"
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive'
+                }
+                
+                timeout = aiohttp.ClientTimeout(total=12)
+                
+                async with session.get(url, headers=headers, timeout=timeout) as response:
+                    if response.status == 429:
+                        # Rate limited - exponential backoff
+                        if retry < max_retries:
+                            await asyncio.sleep(2 ** retry)
+                            self.scraping_stats['ios_rate_limited'] += 1
+                            continue
+                        else:
+                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'rate_limited'}
+                    
+                    elif response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        developer_url = None
+                        
+                        # Priority 1: Look for "Developer Website" text first
+                        try:
+                            all_links = soup.find_all('a', href=True)
+                            for link in all_links:
+                                href = link.get('href', '')
+                                text = link.get_text(strip=True).lower()
+                                if 'developer website' in text and href.startswith('http'):
+                                    if not any(keyword in href.lower() for keyword in ['apps.apple.com', 'privacy', 'policy']):
+                                        developer_url = href
+                                        break
+                        except Exception as e:
+                            logger.debug(f"Error in Priority 1 search: {str(e)}")
+                        
+                        # Backup: Look in the information section for any external link
+                        if not developer_url:
+                            try:
+                                all_links = soup.find_all('a', href=True)
+                                valid_urls = []
+                                for link in all_links:
+                                    href = link.get('href', '')
+                                    if (href.startswith('http') and 
+                                        not 'apps.apple.com' in href and
+                                        not 'support.apple.com' in href and
+                                        not 'itunes.apple.com' in href and
+                                        not any(keyword in href.lower() for keyword in 
+                                               ['privacy', 'policy', 'terms', 'support', 'about', 
+                                                'bug', 'feedback', 'legal', 'cookie', 'contact', 'help'])):
+                                        valid_urls.append(href)
+                                if valid_urls:
+                                    developer_url = valid_urls[0]
+                            except Exception as e:
+                                logger.debug(f"Error in Priority 2 search: {str(e)}")
+                        
+                        if developer_url:
+                            developer_url = developer_url.rstrip('/')
+                            app_ads_url = f"{developer_url}/app-ads.txt"
+                            self.scraping_stats['ios_success'] += 1
+                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': app_ads_url, 'status': 'success'}
+                        else:
+                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'no_website_found'}
+                    
+                    elif response.status == 404:
+                        return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'not_found'}
+                    
+                    else:
+                        # Other HTTP errors - retry once
+                        if retry < max_retries:
+                            await asyncio.sleep(1 * (retry + 1))
+                            continue
+                        else:
+                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': f'http_error_{response.status}'}
+                        
+            except asyncio.TimeoutError:
+                if retry < max_retries:
+                    await asyncio.sleep(1 * (retry + 1))
+                    continue
+                return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'timeout'}
+                
+            except Exception as e:
+                if retry < max_retries:
+                    await asyncio.sleep(1 * (retry + 1))
+                    continue
+                else:
+                    return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': f'error: {str(e)[:30]}'}
+        
+        # Shouldn't reach here, but just in case
+        return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'unknown_error'}
+    
+    async def extract_android_urls(self, android_bundles):
+        """Extract URLs from Android apps"""
+        if not android_bundles:
+            return []
+        
+        logger.info(f"Processing {len(android_bundles)} Android apps...")
+        
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=self.android_workers)
+        results = []
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Process in batches
+            batch_size = 50
+            for i in range(0, len(android_bundles), batch_size):
+                batch = android_bundles[i:i + batch_size]
+                
+                tasks = [self.scrape_android_app(session, bundle_id) for bundle_id in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for result in batch_results:
+                    if isinstance(result, dict):
+                        results.append(result)
+                
+                batch_num = i//batch_size + 1
+                logger.info(f"Android batch {batch_num}: {len(batch)} apps processed ({len(results)} total)")
+        
+        return results
+    
+    async def extract_ios_urls(self, ios_bundles):
+        """Extract URLs from iOS apps asynchronously"""
+        if not ios_bundles:
+            return []
+        
+        logger.info(f"Processing {len(ios_bundles)} iOS apps...")
+        
+        connector = aiohttp.TCPConnector(limit=50, limit_per_host=self.ios_workers)
+        results = []
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Process in batches
+            batch_size = 50
+            for i in range(0, len(ios_bundles), batch_size):
+                batch = ios_bundles[i:i + batch_size]
+                
+                tasks = [self.scrape_ios_app_async(session, bundle_id) for bundle_id in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for result in batch_results:
+                    if isinstance(result, dict):
+                        results.append(result)
+                
+                batch_num = i//batch_size + 1
+                logger.info(f"iOS batch {batch_num}: {len(batch)} apps processed ({len(results)} total)")
+        
+        return results
+    
+    async def verify_ads_txt_detailed(self, session, url, search_lines, bundle_id, platform, max_retries=2):
+        """Verify if app-ads.txt contains each search line individually"""
+        for attempt in range(max_retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/plain,text/html,*/*',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive'
+                }
+                
+                async with session.get(url, headers=headers, timeout=timeout, ssl=False) as response:
+                    if response.status == 200:
+                        content = await response.text()
+                        content_lower = content.lower()
+                        
+                        # Create result dictionary
+                        result = {
+                            'bundle_id': bundle_id,
+                            'platform': platform,
+                            'app_ads_txt_url': url,
+                            'verification_status': 'accessible'
+                        }
+                        
+                        # Check each line individually
+                        lines_found = 0
+                        for line in search_lines:
+                            result[line] = 'TRUE' if line.lower() in content_lower else 'FALSE'
+                            if result[line] == 'TRUE':
+                                lines_found += 1
+                        
+                        result['total_lines_found'] = lines_found
+                        result['has_all_lines'] = 'TRUE' if lines_found == len(search_lines) else 'FALSE'
+                        
+                        return result
+                        
+                    else:
+                        if attempt < max_retries:
+                            await asyncio.sleep(1 * (attempt + 1))
+                            continue
+                        
+                        # Create result with all lines as FALSE
+                        result = {
+                            'bundle_id': bundle_id,
+                            'platform': platform,
+                            'app_ads_txt_url': url,
+                            'verification_status': f'http_error_{response.status}'
+                        }
+                        
+                        for line in search_lines:
+                            result[line] = 'FALSE'
+                            
+                        result['total_lines_found'] = 0
+                        result['has_all_lines'] = 'FALSE'
+                        return result
+                        
+            except asyncio.TimeoutError:
+                if attempt < max_retries:
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                    
+                result = {
+                    'bundle_id': bundle_id,
+                    'platform': platform,
+                    'app_ads_txt_url': url,
+                    'verification_status': 'timeout'
+                }
+                
+                for line in search_lines:
+                    result[line] = 'FALSE'
+                    
+                result['total_lines_found'] = 0
+                result['has_all_lines'] = 'FALSE'
+                return result
+                
+            except Exception as e:
+                if attempt < max_retries:
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                    
+                result = {
+                    'bundle_id': bundle_id,
+                    'platform': platform,
+                    'app_ads_txt_url': url,
+                    'verification_status': f'error: {str(e)[:30]}'
+                }
+                
+                for line in search_lines:
+                    result[line] = 'FALSE'
+                    
+                result['total_lines_found'] = 0
+                result['has_all_lines'] = 'FALSE'
+                return result
+    
+    async def verify_extracted_urls(self, extracted_results, search_lines):
+        """Verify all extracted URLs for ads.txt content"""
+        # Filter only successful extractions
+        urls_to_verify = [
+            result for result in extracted_results 
+            if result.get('status') == 'success' and result.get('app_ads_txt_url')
+        ]
+        
+        if not urls_to_verify:
+            logger.info("No URLs to verify")
+            return []
+        
+        logger.info(f"Verifying {len(urls_to_verify)} ads.txt URLs...")
+        
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=self.verification_workers,
+            ttl_dns_cache=300,
+            use_dns_cache=True
+        )
+        
+        verified_results = []
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            # Process in batches
+            batch_size = 50
+            for i in range(0, len(urls_to_verify), batch_size):
+                batch = urls_to_verify[i:i + batch_size]
+                
+                tasks = []
+                for item in batch:
+                    task = self.verify_ads_txt_detailed(
+                        session, 
+                        item['app_ads_txt_url'], 
+                        search_lines, 
+                        item['bundle_id'], 
+                        item['platform']
+                    )
+                    tasks.append(task)
+                
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for result in batch_results:
+                    if isinstance(result, dict):
+                        verified_results.append(result)
+                        
+                        # Update stats
+                        if result['verification_status'] == 'accessible':
+                            self.verification_stats['accessible'] += 1
+                            if result['has_all_lines'] == 'TRUE':
+                                self.verification_stats['contains_all_lines'] += 1
+                            else:
+                                self.verification_stats['missing_some_lines'] += 1
+                        else:
+                            self.verification_stats['inaccessible'] += 1
+                
+                logger.info(f"Verification batch {i//batch_size + 1}: {len(batch)} URLs processed")
+        
+        # Add failed extractions as well (with all FALSE values)
+        failed_extractions = [
+            result for result in extracted_results 
+            if result.get('status') != 'success' or not result.get('app_ads_txt_url')
+        ]
+        
+        for failed in failed_extractions:
+            result = {
+                'bundle_id': failed['bundle_id'],
+                'platform': failed['platform'],
+                'app_ads_txt_url': failed.get('app_ads_txt_url', ''),
+                'verification_status': f'extraction_failed_{failed.get("status", "unknown")}'
+            }
+            
+            # Add all lines as FALSE
+            for line in search_lines:
+                result[line] = 'FALSE'
+                
+            result['total_lines_found'] = 0
+            result['has_all_lines'] = 'FALSE'
+            verified_results.append(result)
+        
+        return verified_results
+    
+    async def run_complete_analysis(self, apps_df, search_lines, user_email="unknown"):
+        """Run the complete analysis pipeline"""
+        start_time = time.time()
+        
+        logger.info(f"[{user_email}] Starting Complete App Ads.txt Analysis")
+        logger.info(f"[{user_email}] ========================================")
+        
+        # Step 1: Load and separate bundle IDs
+        android_bundles, ios_bundles = self.load_bundle_ids_from_df(apps_df)
+        
+        self.scraping_stats['total_apps'] = len(android_bundles) + len(ios_bundles)
+        self.scraping_stats['android_apps'] = len(android_bundles)
+        self.scraping_stats['ios_apps'] = len(ios_bundles)
+        
+        logger.info(f"[{user_email}] Total apps: {self.scraping_stats['total_apps']:,}")
+        logger.info(f"[{user_email}] Android apps: {len(android_bundles):,}")
+        logger.info(f"[{user_email}] iOS apps: {len(ios_bundles):,}")
+        
+        # Step 2: Extract URLs (parallel processing)
+        logger.info(f"[{user_email}] Phase 1: Extracting Developer Website URLs")
+        logger.info(f"[{user_email}] ----------------------------------------")
+        
+        # Run Android and iOS extraction in parallel
+        android_task = asyncio.create_task(self.extract_android_urls(android_bundles))
+        ios_task = asyncio.create_task(self.extract_ios_urls(ios_bundles))
+
+        android_results, ios_results = await asyncio.gather(android_task, ios_task)
+        all_extraction_results = android_results + ios_results
+        
+        # Step 3: Verify ads.txt files
+        logger.info(f"[{user_email}] Phase 2: Verifying App-Ads.txt Files")
+        logger.info(f"[{user_email}] ----------------------------------------")
+        self.verification_stats['total_urls'] = len([r for r in all_extraction_results if r.get('status') == 'success'])
+        verified_results = await self.verify_extracted_urls(all_extraction_results, search_lines)
+        
+        # Step 4: Log final statistics
+        elapsed_time = time.time() - start_time
+        logger.info(f"[{user_email}] Processing complete!")
+        logger.info(f"[{user_email}] Total time: {elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] Android success: {self.scraping_stats['android_success']}/{self.scraping_stats['android_apps']}")
+        logger.info(f"[{user_email}] iOS success: {self.scraping_stats['ios_success']}/{self.scraping_stats['ios_apps']}")
+        logger.info(f"[{user_email}] URLs verified: {self.verification_stats['accessible']}/{self.verification_stats['total_urls']}")
+        
+        return verified_results
 
 # Initialize the Flask application
 app = Flask(__name__)
@@ -44,12 +590,22 @@ google = oauth.register(
 )
 
 ALLOWED_EMAIL_DOMAIN = os.environ.get('ALLOWED_EMAIL_DOMAIN', 'thejungletechnology.com')
+DEV_MODE = os.environ.get('DEV_MODE', 'False').lower() == 'true'
 
 # --- Auth Decorators & Helpers ---
 def login_required(f):
     """Decorator to check if user is logged in and has valid company email."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        # In DEV_MODE, bypass authentication
+        if DEV_MODE and 'user' not in session:
+            session['user'] = {
+                'email': 'dev@localhost',
+                'name': 'Dev User',
+                'picture': ''
+            }
+            logger.info("DEV_MODE: Bypassing authentication")
+        
         if 'user' not in session:
             return redirect(url_for('login'))
         return f(*args, **kwargs)
@@ -59,320 +615,40 @@ def is_company_email(email):
     """Check if email ends with the allowed company domain."""
     return email.endswith(f"@{ALLOWED_EMAIL_DOMAIN}")
 
-# --- URL Construction Logic ---
-def get_store_url(bundle_id):
-    """
-    Constructs the appropriate store URL based on the bundle ID format.
-    Args:
-        bundle_id (str): The bundle ID or app store ID
-    Returns:
-        tuple: (store_type, url) where store_type is either 'play_store' or 'app_store'
-        or (None, None) if there's an error
-    """
-    try:
-        if not bundle_id:
-            return None, None
-            
-        # Remove any whitespace and any 'id=' prefix
-        bundle_id = str(bundle_id).strip()
-        if bundle_id.startswith('id='):
-            bundle_id = bundle_id[3:]
-        
-        if not bundle_id:  # If bundle_id is empty after cleaning
-            return None, None
-        
-        # Check if the bundle ID is numeric (App Store ID)
-        if bundle_id.isdigit():
-            return 'app_store', f'https://apps.apple.com/app/id{bundle_id}'
-        else:
-            # If it contains dots, it's likely a Play Store bundle ID
-            return 'play_store', f'https://play.google.com/store/apps/details?id={bundle_id}'
-    except Exception as e:
-        print(f'Error in get_store_url for bundle_id {bundle_id}: {str(e)}')
-        return None, None
-
-def get_support_website(store_url, store_type='play_store'):
-    """
-    Extracts the support website URL from the app store page.
-    """
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-
-        # Simple retry loop for store page fetch (to handle transient errors and 429)
-        max_retries = 3
-        base_delay = 0.5
-        backoff = 2.0
-        last_exc = None
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(store_url, headers=headers, timeout=10)
-                response.raise_for_status()
-                break
-            except requests.exceptions.RequestException as e:
-                last_exc = e
-                if attempt == max_retries - 1:
-                    raise
-                sleep_for = base_delay * (backoff ** attempt) + random.uniform(0, 0.25)
-                time.sleep(sleep_for)
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        if store_type == 'play_store':
-            # Look for the "App support" section and find the website link
-            support_section = soup.find_all('div', string=re.compile('App support|Developer|Website'))
-            
-            if support_section:
-                for section in support_section:
-                    parent = section.find_parent('div')
-                    if parent:
-                        links = parent.find_all('a', href=True)
-                        for link in links:
-                            href = link.get('href', '')
-                            if (href.startswith('http') and 
-                                not href.startswith('https://play.google.com') and
-                                not href.startswith('https://support.google.com') and
-                                not 'policy' in href.lower() and
-                                not 'privacy' in href.lower()):
-                                return href
-        else:  # App Store
-            # Look for the developer's website by specifically finding the "Developer Website" text
-            try:
-                # First try to find the text "Developer Website"
-                developer_website_element = soup.find(string=re.compile("Developer Website", re.IGNORECASE))
-                if developer_website_element:
-                    # Find the closest 'a' tag near this text
-                    parent_element = developer_website_element.find_parent()
-                    if parent_element:
-                        link = parent_element.find_next('a')
-                        if link:
-                            href = link.get('href', '')
-                            if (href and 
-                                href.startswith('http') and 
-                                not href.startswith('https://apps.apple.com') and
-                                not 'developer/id' in href):
-                                # Clean the URL to keep only up to the domain
-                                domain_endings = ['.com', '.org', '.net', '.io', '.app', '.games', '.dev', '.co']
-                                for ending in domain_endings:
-                                    if ending in href:
-                                        # Find the position of the domain ending
-                                        pos = href.find(ending) + len(ending)
-                                        # Keep only up to the domain ending
-                                        href = href[:pos]
-                                        break
-                                return href
-
-                # Backup: Look in the information section for any external link
-                info_section = soup.find('section', {'class': 'l-content-width section section--bordered section--information'})
-                if info_section:
-                    external_links = info_section.find_all('a', {'class': 'link'})
-                    for link in external_links:
-                        href = link.get('href', '')
-                        if (href and 
-                            href.startswith('http') and 
-                            not href.startswith('https://apps.apple.com') and
-                            not 'developer/id' in href and
-                            not 'privacy' in href.lower() and
-                            not 'support.apple.com' in href.lower()):
-                            return href
-                            
-            except Exception as e:
-                print(f"Error finding developer website in App Store page: {str(e)}")
-                return None
-                            
-        return None
-        
-    except Exception as e:
-        print(f"Error fetching support website: {str(e)}")
-        return None
-
-def construct_app_ads_url(website_url):
-    """
-    Constructs the app-ads.txt URL from the website URL.
-    """
-    try:
-        if not website_url:
-            return None
-            
-        # Validate URL format
-        if not website_url.startswith(('http://', 'https://')):
-            print(f'Invalid website URL format: {website_url}')
-            return None
-            
-        # Remove trailing slash if present
-        website_url = website_url.rstrip('/')
-        
-        # Check if app-ads.txt is already in the URL
-        if website_url.endswith('app-ads.txt'):
-            return website_url
-        
-        # Append app-ads.txt
-        return f"{website_url}/app-ads.txt"
-    except Exception as e:
-        print(f'Error in construct_app_ads_url: {str(e)}')
-        return None
-
-def get_app_ads_url(bundle_id):
-    """
-    Gets the app-ads.txt URL for a bundle ID by checking the store page.
-    """
-    try:
-        store_type, url = get_store_url(bundle_id)
-        if not store_type or not url:
-            return None
-            
-        support_website = get_support_website(url, store_type)
-        if not support_website:
-            return None
-            
-        return construct_app_ads_url(support_website)
-    except Exception as e:
-        print(f'Error getting app-ads URL for {bundle_id}: {str(e)}')
-        return None
-
 # --- Core Logic ---
-
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_BASE_DELAY = 0.5
-DEFAULT_BACKOFF = 2.0
-
-async def fetch_text_with_retries(session, url, timeout=10,
-                                  max_retries=DEFAULT_MAX_RETRIES,
-                                  base_delay=DEFAULT_BASE_DELAY,
-                                  backoff=DEFAULT_BACKOFF):
-    """Fetch URL text with retries and exponential backoff.
-    Returns (text, error_message). text=None on failure.
-    """
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return await resp.text(), None
-                elif resp.status in RETRYABLE_STATUSES:
-                    last_error = f"HTTP {resp.status}"
-                    # backoff and retry
-                else:
-                    return None, f"HTTP {resp.status}"
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            last_error = str(e)
-            # backoff and retry
-
-        # sleep before next attempt (except after last)
-        if attempt < max_retries - 1:
-            sleep_for = base_delay * (backoff ** attempt) + random.uniform(0, 0.25)
-            await asyncio.sleep(sleep_for)
-
-    # exhausted
-    return None, (last_error or "Unknown error")
-
-def clean_line(line):
-    """
-    Removes comments, surrounding quotes, and trailing/leading whitespace.
-    """
-    line = line.split('#')[0]
-    line = line.strip()
-    if line.startswith('"') and line.endswith('"'):
-        line = line[1:-1]
-    line = line.replace('，', ',')
-    return line.strip()
 
 def load_lines_from_memory(file_content):
     """Loads and cleans lines from a file's content in memory."""
-    lines = {clean_line(line) for line in file_content.splitlines() if line.strip()}
+    lines = []
+    for line in file_content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and not line.startswith('//'):
+            lines.append(line)
     return lines
 
-async def fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check, semaphore, url_cache):
-    """Fetches a URL and checks for matching lines using a set for speed."""
-    async with semaphore:
-        result = {"Bundle ID": bundle_id, "AppAdsURL": url}
-        try:
-            # If no URL is provided, try to get it from the store
-            if (not url or pd.isna(url) or not isinstance(url, str)):
-                # try cache first
-                if url_cache is not None and bundle_id in url_cache:
-                    url = url_cache[bundle_id]
-                else:
-                    url = get_app_ads_url(bundle_id)
-                    if url_cache is not None:
-                        url_cache[bundle_id] = url
-                result["AppAdsURL"] = url if url else ""
-                
-            if url:  # Only proceed if we have a URL
-                content, err = await fetch_text_with_retries(session, url, timeout=10)
-                if content is not None:
-                    downloaded_lines_set = {clean_line(line) for line in content.splitlines()}
-                    result["TXT Found"] = "Yes"
-                    # Check if any line contains the search term (substring matching)
-                    matches = set()
-                    for check_line in lines_to_check:
-                        for downloaded_line in downloaded_lines_set:
-                            if check_line in downloaded_line:
-                                matches.add(check_line)
-                                break
-                    for check_line in ordered_lines_to_check:
-                        result[f"{check_line}"] = check_line in matches
-                    result["Error"] = "-"
-                else:
-                    result["TXT Found"] = "No"
-                    result["Error"] = err or "Fetch failed"
-            else:
-                result["TXT Found"] = "No"
-                result["Error"] = "No app-ads.txt URL found"
-        except Exception as e:
-            result["TXT Found"] = "No"
-            result["Error"] = str(e)
-        
-        # Ensure all check lines are present in the result
-        if result["TXT Found"] == "No":
-            for check_line in ordered_lines_to_check:
-                result[f"{check_line}"] = False
-        
-        return result
-
-async def process_files_async(apps_df, lines_to_check):
-    """The main asynchronous processing logic."""
-    results = []
-    ordered_lines_to_check = sorted(list(lines_to_check))
-    column_headers = ["Bundle ID", "AppAdsURL", "TXT Found", "Error"] + \
-                     [f"{line}" for line in ordered_lines_to_check]
-
-    # Configurable concurrency via env var, default 50 (lower for large jobs)
-    try:
-        concurrency = int(os.environ.get("APP_CONCURRENCY", "50"))
-        concurrency = max(10, min(concurrency, 200))
-    except Exception:
-        concurrency = 50
-
-    # Create per-run semaphore bound to this event loop
-    semaphore = asyncio.Semaphore(concurrency)
-
-    # Per-run URL cache to avoid re-scraping duplicated bundle IDs
-    url_cache = {}
-
-    timeout = aiohttp.ClientTimeout(total=20, sock_connect=10, sock_read=10)
-    connector = aiohttp.TCPConnector(limit=0, limit_per_host=10, ttl_dns_cache=300)
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Accept-Encoding': 'gzip, deflate',
-    }
-
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
-        tasks = []
-        for _, row in apps_df.iterrows():
-            bundle_id = row.get("Bundle ID")
-            url = row.get("AppAdsURL")
-            tasks.append(fetch_and_check(session, bundle_id, url, lines_to_check, ordered_lines_to_check, semaphore, url_cache))
-
-        for future in asyncio.as_completed(tasks):
-            res = await future
-            results.append(res)
+async def process_files_async(apps_df, lines_to_check, user_email="unknown"):
+    """
+    Process files using the complete analyzer.
     
-    # Create the final DataFrame and return it
-    return pd.DataFrame(results, columns=column_headers)
+    Args:
+        apps_df: DataFrame with bundle IDs
+        lines_to_check: List of lines to search for in ads.txt files
+        user_email: Email of user for logging
+    
+    Returns:
+        DataFrame with complete analysis results
+    """
+    analyzer = CompleteAdsTxtAnalyzer(android_workers=50, ios_workers=50, verification_workers=30)
+    
+    # Run the complete analysis
+    verified_results = await analyzer.run_complete_analysis(apps_df, lines_to_check, user_email)
+    
+    # Create the final DataFrame with proper column order
+    if verified_results:
+        df_results = pd.DataFrame(verified_results)
+        return df_results
+    else:
+        return pd.DataFrame(verified_results)
 
 # --- Flask Routes ---
 # This section defines the web page and the file handling logic.
@@ -395,12 +671,14 @@ def authorize():
     user_info = token.get('userinfo')
     
     if not user_info:
+        logger.warning("OAuth: Failed to retrieve user info")
         return "Failed to retrieve user info.", 403
     
     email = user_info.get('email', '').lower()
     
     # Check if email is from company domain
     if not is_company_email(email):
+        logger.warning(f"OAuth: Access denied for {email} - not company domain")
         return f"Access denied. You must use a company email (@{ALLOWED_EMAIL_DOMAIN}). Your email: {email}", 403
     
     # Store user info in session
@@ -411,6 +689,7 @@ def authorize():
     }
     session.permanent = True
     
+    logger.info(f"OAuth: User logged in successfully - {email}")
     return redirect(url_for('index'))
 
 @app.route('/logout')
@@ -440,6 +719,15 @@ def favicon():
 @app.route('/', methods=['GET'])
 def index():
     """Renders the main upload page."""
+    # In DEV_MODE, auto-login without OAuth
+    if DEV_MODE and 'user' not in session:
+        session['user'] = {
+            'email': 'dev@localhost',
+            'name': 'Dev User',
+            'picture': ''
+        }
+        logger.info("DEV_MODE: Auto-login bypassing OAuth")
+    
     if 'user' not in session:
         return redirect(url_for('login'))
     return render_template('index.html')
@@ -448,26 +736,60 @@ def index():
 @login_required
 def upload_files():
     """Handles file uploads, processes them, and returns the result CSV."""
+    user_email = session.get('user', {}).get('email', 'unknown')
+    
     if 'apps_file' not in request.files or 'lines_file' not in request.files:
+        logger.warning(f"[{user_email}] Upload failed: Missing files in request")
         return "Missing file(s) in the form submission.", 400
 
     apps_file = request.files['apps_file']
     lines_file = request.files['lines_file']
 
     if apps_file.filename == '' or lines_file.filename == '':
+        logger.warning(f"[{user_email}] Upload failed: Empty filename")
         return "No selected file.", 400
 
     try:
+        # Start timing the entire upload-to-download process
+        upload_start_time = time.time()
+        
+        process = psutil.Process(os_module.getpid())
+        upload_start_memory = process.memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"[{user_email}] Files uploaded: apps={apps_file.filename}, lines={lines_file.filename} | Memory: {upload_start_memory:.2f} MB")
+        
         # Read file contents into memory
         apps_csv_content = apps_file.stream.read().decode("utf-8")
         lines_txt_content = lines_file.stream.read().decode("utf-8")
+        print(f"DEBUG: CSV content length: {len(apps_csv_content)}", flush=True)
 
         # Load data using pandas and our custom function
         apps_df = pd.read_csv(io.StringIO(apps_csv_content))
+        print(f"DEBUG: Loaded CSV, columns: {list(apps_df.columns)}, shape: {apps_df.shape}", flush=True)
+        logger.info(f"[{user_email}] Files parsed: {len(apps_df)} apps, columns={list(apps_df.columns)}")
         lines_to_check = load_lines_from_memory(lines_txt_content)
+        
+        # Check if AppAdsURL column exists
+        has_url_column = 'AppAdsURL' in apps_df.columns or any('app' in col.lower() and 'ads' in col.lower() for col in apps_df.columns)
+        if not has_url_column:
+            logger.info(f"[{user_email}] No AppAdsURL column found - will auto-discover URLs from app stores (slower)")
+        else:
+            urls_provided = apps_df['AppAdsURL'].notna().sum()
+            logger.info(f"[{user_email}] AppAdsURL column found: {urls_provided}/{len(apps_df)} apps have URLs pre-filled")
+        
+        logger.info(f"[{user_email}] Files parsed: {len(apps_df)} apps, {len(lines_to_check)} search terms")
 
         # Run the async processing and get the results DataFrame
-        results_df = asyncio.run(process_files_async(apps_df, lines_to_check))
+        start_time = time.time()
+        process = psutil.Process(os_module.getpid())
+        start_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        results_df = asyncio.run(process_files_async(apps_df, lines_to_check, user_email))
+        
+        elapsed_time = time.time() - start_time
+        end_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        logger.info(f"[{user_email}] Processing completed in {elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] Upload endpoint memory: Start {start_memory:.2f} MB, End {end_memory:.2f} MB")
         
         # Save the results DataFrame to an in-memory buffer
         output_buffer = io.StringIO()
@@ -482,6 +804,19 @@ def upload_files():
         # Create a dynamic filename with the current timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         dynamic_filename = f"results_{timestamp}.csv"
+        
+        # Count matches for logging (new structure uses 'verification_status' and 'has_all_lines')
+        accessible_count = (results_df['verification_status'] == 'accessible').sum() if 'verification_status' in results_df.columns else 0
+        all_lines_count = (results_df['has_all_lines'] == 'TRUE').sum() if 'has_all_lines' in results_df.columns else 0
+        upload_end_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        # Calculate total time from upload to final response
+        total_elapsed_time = time.time() - upload_start_time
+        
+        logger.info(f"[{user_email}] Results: {accessible_count}/{len(results_df)} apps had accessible app-ads.txt files")
+        logger.info(f"[{user_email}] Results: {all_lines_count}/{len(results_df)} apps matched all search lines")
+        logger.info(f"[{user_email}] Total processing time (upload to final): {total_elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] Sending file: {dynamic_filename} | Final memory: {upload_end_memory:.2f} MB")
 
         # Create response with download cookie
         response = make_response(send_file(
@@ -497,6 +832,7 @@ def upload_files():
         return response
 
     except Exception as e:
+        logger.error(f"[{user_email}] Upload processing failed: {str(e)}", exc_info=True)
         return f"An error occurred: {e}", 500
 
 if __name__ == '__main__':

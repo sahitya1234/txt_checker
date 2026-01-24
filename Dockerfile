@@ -16,5 +16,6 @@ ENV PORT=8080
 # Expose port
 EXPOSE 8080
 
-# Run with gunicorn
-CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 600 check_app_ads:app
+# Run with gunicorn (Cloud Run)
+# Increase timeout to support long verification jobs
+CMD exec gunicorn --bind :$PORT --workers 2 --threads 4 --timeout 3600 check_app_ads:app
