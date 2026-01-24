@@ -8,3 +8,4 @@ authlib
 flask-session
 python-dotenv
 openpyxl
+psutil
