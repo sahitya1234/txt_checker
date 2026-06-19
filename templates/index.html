@@ -135,11 +135,11 @@
                     </div>
                     <button type="submit" id="submit-btn"
                             class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold py-3 px-4 rounded-lg hover:from-blue-700 hover:to-cyan-700 transition duration-300">
-                        Process Files and Download Results
+                        Process Files (results emailed to you)
                     </button>
                 </form>
                 <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
-                    <p>Processing... This may take a few moments. Your download will start automatically.</p>
+                    <p>Submitting your files…</p>
                 </div>
             </div>
 
@@ -254,7 +254,7 @@ bidstack.com</pre>
             document.getElementById('loading-message').classList.add('hidden');
             document.getElementById('loading-overlay').classList.add('hidden');
             document.getElementById('submit-btn').disabled = false;
-            document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
+            document.getElementById('submit-btn').innerText = 'Process Files (results emailed to you)';
         }
 
         function showSampleModal() {
@@ -320,55 +320,36 @@ bidstack.com</pre>
             }, 1500);
         }
 
-        document.getElementById('upload-form').addEventListener('submit', function(e) {
-            // Show loader immediately
-            showLoader();
-            
-            document.getElementById('submit-btn').disabled = true;
-            document.getElementById('submit-btn').innerText = 'Processing...';
-            document.getElementById('loading-message').classList.remove('hidden');
+        document.getElementById('upload-form').addEventListener('submit', async function(e) {
+            // Process happens in the background and the result is emailed, so we
+            // submit via fetch and show a confirmation instead of downloading.
+            e.preventDefault();
 
-            // Set a unique cookie value before submission
-            const downloadToken = new Date().getTime();
-            document.cookie = 'downloadToken=' + downloadToken + '; path=/';
-            
-            // Poll for download completion by checking if server set the cookie
-            let attempts = 0;
-            const maxAttempts = 1200; // 10 minutes (1200 * 500ms = 600s)
-            
-            const checkDownloadInterval = setInterval(function() {
-                attempts++;
-                
-                // Check if download cookie was set by server
-                const cookies = document.cookie.split(';');
-                let downloadStarted = false;
-                
-                for (let cookie of cookies) {
-                    if (cookie.trim().startsWith('download_started=')) {
-                        downloadStarted = true;
-                        break;
-                    }
+            const btn = document.getElementById('submit-btn');
+            const msg = document.getElementById('loading-message');
+            const originalText = 'Process Files (results emailed to you)';
+
+            btn.disabled = true;
+            btn.innerText = 'Submitting...';
+            msg.classList.remove('hidden');
+            msg.innerHTML = '<p>Submitting your files…</p>';
+
+            try {
+                const resp = await fetch('/upload', { method: 'POST', body: new FormData(e.target) });
+                const text = await resp.text();
+
+                if (resp.status === 202) {
+                    msg.innerHTML = '<p class="text-green-600 font-semibold">✅ ' + text + '</p>';
+                    e.target.reset();
+                } else {
+                    msg.innerHTML = '<p class="text-red-600 font-semibold">⚠️ ' + text + '</p>';
                 }
-                
-                // If download started or max attempts reached
-                if (downloadStarted || attempts >= maxAttempts) {
-                    clearInterval(checkDownloadInterval);
-                    
-                    // Clean up the cookie
-                    document.cookie = 'download_started=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-                    
-                    // Hide loader
-                    hideLoader();
-                    
-                    // Reset form
-                    setTimeout(function() {
-                        document.getElementById('submit-btn').disabled = false;
-                        document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
-                        document.getElementById('loading-message').classList.add('hidden');
-                        document.getElementById('upload-form').reset();
-                    }, 1500);
-                }
-            }, 500); // Check every 500ms
+            } catch (err) {
+                msg.innerHTML = '<p class="text-red-600 font-semibold">⚠️ Network error: ' + err + '</p>';
+            } finally {
+                btn.disabled = false;
+                btn.innerText = originalText;
+            }
         });
     </script>
 </body>

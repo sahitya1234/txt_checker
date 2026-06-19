@@ -4,7 +4,7 @@ import pandas as pd
 import re
 import io
 from datetime import datetime
-from flask import Flask, render_template, request, send_file, session, redirect, url_for, send_from_directory, make_response
+from flask import Flask, render_template, request, session, redirect, url_for, send_from_directory
 from werkzeug.middleware.proxy_fix import ProxyFix
 import time
 import requests
@@ -16,9 +16,10 @@ from authlib.integrations.flask_client import OAuth
 from dotenv import load_dotenv
 import logging
 import sys
-import psutil
-import os as os_module
 import csv
+import json
+import threading
+import email_sender
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,6 +31,175 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+# --- URL normalization & metadata lookup helpers ---
+
+# Path to the server-side prefetched bundle_id -> app-ads.txt URL metadata.
+METADATA_CSV = os.environ.get('METADATA_CSV', 'metadata.csv')
+
+# Local-file checkpoint of discovery outcomes (resolved URLs + failure tracking).
+# Lets re-runs skip already-resolved / known-dead apps and retry only transient
+# failures. NOTE: on Cloud Run the local disk is ephemeral; swap for GCS later.
+CHECKPOINT_FILE = os.environ.get('CHECKPOINT_FILE', 'checkpoint.csv')
+# After this many failed discovery attempts, stop retrying an app (mark dead).
+MAX_DISCOVERY_ATTEMPTS = int(os.environ.get('MAX_DISCOVERY_ATTEMPTS', '5'))
+
+# Collapse repeated '/app-ads.txt/app-ads.txt...' suffixes into a single one.
+_DOUBLED_SUFFIX = re.compile(r'(/app-ads\.txt)(?:/app-ads\.txt)+', re.IGNORECASE)
+
+
+def normalize_app_ads_url(url):
+    """Trim whitespace and collapse doubled '/app-ads.txt' suffixes.
+    Returns '' for blank/NaN values."""
+    if url is None:
+        return ''
+    url = str(url).strip()
+    if not url or url.lower() in ('nan', 'none'):
+        return ''
+    return _DOUBLED_SUFFIX.sub(r'\1', url)
+
+
+def _find_column(columns, *, must_contain):
+    """Return the first column whose lowercased name contains all the given
+    substrings, else None."""
+    for col in columns:
+        lower = str(col).lower().strip()
+        if all(tok in lower for tok in must_contain):
+            return col
+    return None
+
+
+_METADATA_CACHE = None
+
+
+def load_metadata_lookup():
+    """Load (once, cached) the prefetched bundle_id -> app-ads.txt URL mapping
+    from METADATA_CSV. Missing/unreadable file -> empty dict (lookup disabled)."""
+    global _METADATA_CACHE
+    if _METADATA_CACHE is not None:
+        return _METADATA_CACHE
+
+    lookup = {}
+    try:
+        if os.path.exists(METADATA_CSV):
+            df = pd.read_csv(METADATA_CSV, dtype=str, on_bad_lines='skip')
+            bundle_col = _find_column(df.columns, must_contain=('bundle', 'id'))
+            url_col = _find_column(df.columns, must_contain=('app', 'ads'))
+            if bundle_col and url_col:
+                for _, row in df.iterrows():
+                    bundle = str(row.get(bundle_col, '')).strip()
+                    url = normalize_app_ads_url(row.get(url_col, ''))
+                    if bundle and url and bundle not in lookup:
+                        lookup[bundle] = url
+            logger.info(f"Metadata lookup loaded: {len(lookup):,} bundle->URL entries from {METADATA_CSV}")
+        else:
+            logger.info(f"Metadata file '{METADATA_CSV}' not found; metadata lookup disabled")
+    except Exception as e:
+        logger.warning(f"Failed to load metadata lookup from {METADATA_CSV}: {e}")
+
+    _METADATA_CACHE = lookup
+    return lookup
+
+
+# Discovery outcome classification
+_RESOLVED = 'resolved'
+_DEAD = 'dead'
+_RETRYABLE = 'retryable'
+# Failures that are permanent (app genuinely has no resolvable site) -> never retry.
+_TERMINAL_REASONS = {'not_found', 'no_website_found'}
+
+
+class CheckpointStore:
+    """Local-file persistence of per-app discovery outcomes.
+
+    Keyed by bundle_id, stored as CSV columns:
+        bundle_id, status, app_ads_txt_url, attempts, reason, updated_at
+
+    status is one of:
+        'resolved'  -> we have a URL; future runs skip discovery
+        'dead'      -> terminal failure (no site / attempts exhausted); skip forever
+        'retryable' -> transient failure (rate limit / timeout); retry next run
+
+    Writes are atomic (temp file + os.replace). Single-writer assumption holds
+    for the current one-upload-at-a-time flow; the GCS version will add locking.
+    """
+
+    def __init__(self, path=CHECKPOINT_FILE):
+        self.path = path
+        self.entries = {}
+        self._dirty = False
+
+    def load(self):
+        self.entries = {}
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, newline='', encoding='utf-8') as f:
+                    for row in csv.DictReader(f):
+                        bid = (row.get('bundle_id') or '').strip()
+                        if not bid:
+                            continue
+                        self.entries[bid] = {
+                            'status': row.get('status', ''),
+                            'app_ads_txt_url': row.get('app_ads_txt_url', '') or '',
+                            'attempts': int(row.get('attempts', '0') or 0),
+                            'reason': row.get('reason', '') or '',
+                        }
+                logger.info(f"Checkpoint loaded: {len(self.entries):,} entries from {self.path}")
+            else:
+                logger.info(f"No checkpoint at {self.path}; starting fresh")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint {self.path}: {e}")
+            self.entries = {}
+        return self
+
+    def get(self, bundle_id):
+        return self.entries.get(bundle_id)
+
+    def _attempts(self, bundle_id):
+        e = self.entries.get(bundle_id)
+        return e['attempts'] if e else 0
+
+    def record_success(self, bundle_id, url):
+        self.entries[bundle_id] = {
+            'status': _RESOLVED,
+            'app_ads_txt_url': url,
+            'attempts': self._attempts(bundle_id),
+            'reason': 'success',
+        }
+        self._dirty = True
+
+    def record_failure(self, bundle_id, reason):
+        attempts = self._attempts(bundle_id) + 1
+        # Terminal reason, or too many tries -> give up (dead); else keep retrying.
+        if reason in _TERMINAL_REASONS or attempts >= MAX_DISCOVERY_ATTEMPTS:
+            status = _DEAD
+        else:
+            status = _RETRYABLE
+        self.entries[bundle_id] = {
+            'status': status,
+            'app_ads_txt_url': '',
+            'attempts': attempts,
+            'reason': reason,
+        }
+        self._dirty = True
+
+    def save(self):
+        if not self._dirty:
+            return
+        try:
+            tmp = f"{self.path}.tmp"
+            with open(tmp, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['bundle_id', 'status', 'app_ads_txt_url', 'attempts', 'reason', 'updated_at'])
+                now = datetime.now().isoformat()
+                for bid, e in self.entries.items():
+                    writer.writerow([bid, e['status'], e['app_ads_txt_url'], e['attempts'], e.get('reason', ''), now])
+            os.replace(tmp, self.path)
+            self._dirty = False
+            logger.info(f"Checkpoint saved: {len(self.entries):,} entries -> {self.path}")
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint {self.path}: {e}")
+
 
 # --- Complete App Ads.txt Analyzer Class ---
 class CompleteAdsTxtAnalyzer:
@@ -72,40 +242,43 @@ class CompleteAdsTxtAnalyzer:
         
         self.android_regions = ['us', 'gb', 'ca', 'au', 'in']
     
-    def load_bundle_ids_from_df(self, apps_df):
-        """Load and separate bundle IDs by platform from a DataFrame"""
+    def prepare_app_records(self, apps_df):
+        """Build per-app records from the uploaded DataFrame, reading both the
+        bundle ID and any prefilled app-ads.txt URL.
+
+        Returns a list of dicts: {'bundle_id', 'platform', 'app_ads_txt_url'}
+        where 'app_ads_txt_url' is the (normalized) URL from the upload, or ''
+        if the upload didn't provide one. Platform is inferred from the bundle
+        id (all-digits -> iOS, otherwise Android)."""
         try:
-            android_bundles = []
-            ios_bundles = []
-            
-            # Normalize column names
-            for col in apps_df.columns:
-                lower_col = col.lower().strip()
-                if 'bundle' in lower_col and 'id' in lower_col:
-                    bundle_column = col
-                    break
-            else:
+            bundle_column = _find_column(apps_df.columns, must_contain=('bundle', 'id'))
+            if not bundle_column:
                 logger.error("No bundle ID column found in DataFrame")
-                return [], []
-            
-            logger.info(f"Using column: '{bundle_column}'")
-            
+                return []
+            url_column = _find_column(apps_df.columns, must_contain=('app', 'ads'))
+
+            logger.info(f"Using bundle column: '{bundle_column}', URL column: '{url_column}'")
+
+            records = []
             for _, row in apps_df.iterrows():
                 bundle_id = str(row.get(bundle_column, '')).strip()
-                if bundle_id and bundle_id.lower() not in ['', 'nan', 'none']:
-                    if bundle_id.isdigit():
-                        ios_bundles.append(bundle_id)
-                    else:
-                        android_bundles.append(bundle_id)
-            
-            logger.info(f"Loaded bundle IDs from DataFrame")
-            logger.info(f"Distribution: Android: {len(android_bundles):,} | iOS: {len(ios_bundles):,}")
-            
-            return android_bundles, ios_bundles
-            
+                if not bundle_id or bundle_id.lower() in ('', 'nan', 'none'):
+                    continue
+                upload_url = normalize_app_ads_url(row.get(url_column, '')) if url_column else ''
+                platform = 'iOS' if bundle_id.isdigit() else 'android'
+                records.append({
+                    'bundle_id': bundle_id,
+                    'platform': platform,
+                    'app_ads_txt_url': upload_url,
+                })
+
+            n_ios = sum(1 for r in records if r['platform'] == 'iOS')
+            logger.info(f"Prepared {len(records):,} app records | Android: {len(records) - n_ios:,} | iOS: {n_ios:,}")
+            return records
+
         except Exception as e:
-            logger.error(f"Error loading bundle IDs: {e}")
-            return [], []
+            logger.error(f"Error preparing app records: {e}")
+            return []
     
     async def scrape_android_app(self, session, bundle_id, max_retries=3):
         """Scrape Android app for developer website URL"""
@@ -186,159 +359,163 @@ class CompleteAdsTxtAnalyzer:
                     continue
                 return {'bundle_id': bundle_id, 'platform': 'android', 'app_ads_txt_url': '', 'status': f'error: {str(e)[:30]}'}
     
-    async def scrape_ios_app_async(self, session, bundle_id, max_retries=2):
-        """Scrape iOS app asynchronously for developer website URL with retry logic"""
-        for retry in range(max_retries + 1):
+    async def lookup_ios_batch(self, session, bundle_ids, max_retries=4):
+        """Resolve a batch of iOS apps (up to ~150) to developer websites via the
+        iTunes Lookup API. One HTTP request returns structured JSON for the whole
+        batch, which is far more reliable and rate-limit friendly than scraping the
+        App Store HTML one app at a time."""
+        id_param = ','.join(bundle_ids)
+        url = f"https://itunes.apple.com/lookup?id={id_param}&country=us"
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json,text/javascript,*/*',
+            'Accept-Encoding': 'gzip, deflate',
+        }
+
+        def build_results(status):
+            """Fallback result list (one per bundle id) for a failed batch."""
+            return [
+                {'bundle_id': bid, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': status}
+                for bid in bundle_ids
+            ]
+
+        for attempt in range(max_retries + 1):
             try:
-                url = f"https://apps.apple.com/in/app/id{bundle_id}"
-                
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    'Accept-Encoding': 'gzip, deflate',
-                    'Connection': 'keep-alive'
-                }
-                
-                timeout = aiohttp.ClientTimeout(total=12)
-                
+                timeout = aiohttp.ClientTimeout(total=20)
+
                 async with session.get(url, headers=headers, timeout=timeout) as response:
-                    if response.status == 429:
-                        # Rate limited - exponential backoff
-                        if retry < max_retries:
-                            await asyncio.sleep(2 ** retry)
+                    # 403/429 = rate limited by Apple. Be patient (the apps exist),
+                    # back off exponentially with jitter, and keep retrying.
+                    if response.status in (403, 429):
+                        if attempt < max_retries:
+                            await asyncio.sleep((2 ** attempt) + random.uniform(0, 1))
                             self.scraping_stats['ios_rate_limited'] += 1
                             continue
-                        else:
-                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'rate_limited'}
-                    
+                        return build_results('rate_limited')
+
                     elif response.status == 200:
-                        html = await response.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        developer_url = None
-                        
-                        # Priority 1: Look for "Developer Website" text first
-                        try:
-                            all_links = soup.find_all('a', href=True)
-                            for link in all_links:
-                                href = link.get('href', '')
-                                text = link.get_text(strip=True).lower()
-                                if 'developer website' in text and href.startswith('http'):
-                                    if not any(keyword in href.lower() for keyword in ['apps.apple.com', 'privacy', 'policy']):
-                                        developer_url = href
-                                        break
-                        except Exception as e:
-                            logger.debug(f"Error in Priority 1 search: {str(e)}")
-                        
-                        # Backup: Look in the information section for any external link
-                        if not developer_url:
-                            try:
-                                all_links = soup.find_all('a', href=True)
-                                valid_urls = []
-                                for link in all_links:
-                                    href = link.get('href', '')
-                                    if (href.startswith('http') and 
-                                        not 'apps.apple.com' in href and
-                                        not 'support.apple.com' in href and
-                                        not 'itunes.apple.com' in href and
-                                        not any(keyword in href.lower() for keyword in 
-                                               ['privacy', 'policy', 'terms', 'support', 'about', 
-                                                'bug', 'feedback', 'legal', 'cookie', 'contact', 'help'])):
-                                        valid_urls.append(href)
-                                if valid_urls:
-                                    developer_url = valid_urls[0]
-                            except Exception as e:
-                                logger.debug(f"Error in Priority 2 search: {str(e)}")
-                        
-                        if developer_url:
-                            developer_url = developer_url.rstrip('/')
-                            app_ads_url = f"{developer_url}/app-ads.txt"
-                            self.scraping_stats['ios_success'] += 1
-                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': app_ads_url, 'status': 'success'}
-                        else:
-                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'no_website_found'}
-                    
-                    elif response.status == 404:
-                        return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'not_found'}
-                    
+                        # iTunes serves JSON as text/javascript, so parse manually.
+                        text = await response.text()
+                        data = json.loads(text)
+
+                        # Map App Store track IDs -> developer (seller) website.
+                        found_ids = set()
+                        seller_urls = {}
+                        for item in data.get('results', []):
+                            track_id = str(item.get('trackId', ''))
+                            found_ids.add(track_id)
+                            seller_urls[track_id] = (item.get('sellerUrl') or '').strip()
+
+                        batch_results = []
+                        for bid in bundle_ids:
+                            if bid not in found_ids:
+                                # Not returned by the API for this id.
+                                batch_results.append({'bundle_id': bid, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'not_found'})
+                            elif seller_urls[bid]:
+                                developer_url = seller_urls[bid].rstrip('/')
+                                app_ads_url = f"{developer_url}/app-ads.txt"
+                                self.scraping_stats['ios_success'] += 1
+                                batch_results.append({'bundle_id': bid, 'platform': 'iOS', 'app_ads_txt_url': app_ads_url, 'status': 'success'})
+                            else:
+                                # App found but no developer website listed.
+                                batch_results.append({'bundle_id': bid, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'no_website_found'})
+                        return batch_results
+
                     else:
-                        # Other HTTP errors - retry once
-                        if retry < max_retries:
-                            await asyncio.sleep(1 * (retry + 1))
+                        if attempt < max_retries:
+                            await asyncio.sleep(1 * (attempt + 1))
                             continue
-                        else:
-                            return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': f'http_error_{response.status}'}
-                        
+                        return build_results(f'http_error_{response.status}')
+
             except asyncio.TimeoutError:
-                if retry < max_retries:
-                    await asyncio.sleep(1 * (retry + 1))
+                if attempt < max_retries:
+                    await asyncio.sleep(1 * (attempt + 1))
                     continue
-                return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'timeout'}
-                
+                return build_results('timeout')
+
             except Exception as e:
-                if retry < max_retries:
-                    await asyncio.sleep(1 * (retry + 1))
+                if attempt < max_retries:
+                    await asyncio.sleep(1 * (attempt + 1))
                     continue
-                else:
-                    return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': f'error: {str(e)[:30]}'}
-        
-        # Shouldn't reach here, but just in case
-        return {'bundle_id': bundle_id, 'platform': 'iOS', 'app_ads_txt_url': '', 'status': 'unknown_error'}
-    
+                return build_results(f'error: {str(e)[:30]}')
+
+        return build_results('unknown_error')
+
     async def extract_android_urls(self, android_bundles):
-        """Extract URLs from Android apps"""
+        """Extract developer URLs for Android apps.
+
+        Uses a Semaphore to bound concurrency instead of fixed-size batches, so a
+        slow/stalling app no longer blocks the others (no head-of-line blocking).
+        The TCP connector still caps per-host connections."""
         if not android_bundles:
             return []
-        
-        logger.info(f"Processing {len(android_bundles)} Android apps...")
-        
+
+        total = len(android_bundles)
+        logger.info(f"Processing {total} Android apps...")
+
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=self.android_workers)
+        semaphore = asyncio.Semaphore(self.android_workers)
         results = []
-        
+
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Process in batches
-            batch_size = 50
-            for i in range(0, len(android_bundles), batch_size):
-                batch = android_bundles[i:i + batch_size]
-                
-                tasks = [self.scrape_android_app(session, bundle_id) for bundle_id in batch]
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in batch_results:
+            async def scrape_one(bundle_id):
+                async with semaphore:
+                    return await self.scrape_android_app(session, bundle_id)
+
+            tasks = [asyncio.create_task(scrape_one(b)) for b in android_bundles]
+
+            # Collect as each completes so fast apps aren't gated by slow ones.
+            done = 0
+            log_every = max(50, total // 20)  # ~20 progress lines max
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    result = await coro
                     if isinstance(result, dict):
                         results.append(result)
-                
-                batch_num = i//batch_size + 1
-                logger.info(f"Android batch {batch_num}: {len(batch)} apps processed ({len(results)} total)")
-        
+                except Exception as e:
+                    logger.error(f"Android scrape task failed: {e}")
+                done += 1
+                if done % log_every == 0 or done == total:
+                    logger.info(f"Android progress: {done}/{total} processed")
+
         return results
     
     async def extract_ios_urls(self, ios_bundles):
-        """Extract URLs from iOS apps asynchronously"""
+        """Extract developer URLs for iOS apps via the batched iTunes Lookup API.
+
+        Each request resolves up to 150 apps, so a handful of requests covers
+        thousands of apps. Concurrency is kept low to stay under Apple's per-IP
+        rate limit while still running batches in parallel."""
         if not ios_bundles:
             return []
-        
-        logger.info(f"Processing {len(ios_bundles)} iOS apps...")
-        
-        connector = aiohttp.TCPConnector(limit=50, limit_per_host=self.ios_workers)
+
+        logger.info(f"Processing {len(ios_bundles)} iOS apps via iTunes Lookup API...")
+
+        batch_size = 150
+        batches = [ios_bundles[i:i + batch_size] for i in range(0, len(ios_bundles), batch_size)]
+        logger.info(f"iOS: {len(batches)} lookup request(s) for {len(ios_bundles)} apps")
+
+        connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+        semaphore = asyncio.Semaphore(5)
         results = []
-        
+
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Process in batches
-            batch_size = 50
-            for i in range(0, len(ios_bundles), batch_size):
-                batch = ios_bundles[i:i + batch_size]
-                
-                tasks = [self.scrape_ios_app_async(session, bundle_id) for bundle_id in batch]
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in batch_results:
-                    if isinstance(result, dict):
-                        results.append(result)
-                
-                batch_num = i//batch_size + 1
-                logger.info(f"iOS batch {batch_num}: {len(batch)} apps processed ({len(results)} total)")
-        
+            async def run_batch(batch, batch_num):
+                async with semaphore:
+                    batch_results = await self.lookup_ios_batch(session, batch)
+                    logger.info(f"iOS batch {batch_num}/{len(batches)}: {len(batch)} apps resolved")
+                    return batch_results
+
+            tasks = [run_batch(batch, i + 1) for i, batch in enumerate(batches)]
+            completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in completed:
+                if isinstance(result, list):
+                    results.extend(result)
+                elif isinstance(result, Exception):
+                    logger.error(f"iOS batch failed: {result}")
+
         return results
     
     async def verify_ads_txt_detailed(self, session, url, search_lines, bundle_id, platform, max_retries=2):
@@ -438,52 +615,65 @@ class CompleteAdsTxtAnalyzer:
                 return result
     
     async def verify_extracted_urls(self, extracted_results, search_lines):
-        """Verify all extracted URLs for ads.txt content"""
-        # Filter only successful extractions
+        """Verify extracted URLs for ads.txt content.
+
+        Many apps share the same publisher app-ads.txt URL, so we fetch+check
+        each UNIQUE URL only once and fan the per-URL result back out to every
+        app that uses it. This cuts network calls dramatically on large inputs."""
+        # Only successful extractions with a URL get fetched
         urls_to_verify = [
-            result for result in extracted_results 
+            result for result in extracted_results
             if result.get('status') == 'success' and result.get('app_ads_txt_url')
         ]
-        
-        if not urls_to_verify:
-            logger.info("No URLs to verify")
-            return []
-        
-        logger.info(f"Verifying {len(urls_to_verify)} ads.txt URLs...")
-        
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=self.verification_workers,
-            ttl_dns_cache=300,
-            use_dns_cache=True
-        )
-        
+
+        # Group apps by their (unique) URL
+        url_to_apps = {}
+        for item in urls_to_verify:
+            url_to_apps.setdefault(item['app_ads_txt_url'], []).append(item)
+
+        unique_urls = list(url_to_apps.keys())
+        logger.info(f"Verifying {len(unique_urls):,} unique URLs "
+                    f"covering {len(urls_to_verify):,} apps "
+                    f"({len(urls_to_verify) - len(unique_urls):,} duplicate fetches avoided)")
+
         verified_results = []
-        
-        async with aiohttp.ClientSession(connector=connector) as session:
-            # Process in batches
-            batch_size = 50
-            for i in range(0, len(urls_to_verify), batch_size):
-                batch = urls_to_verify[i:i + batch_size]
-                
-                tasks = []
-                for item in batch:
-                    task = self.verify_ads_txt_detailed(
-                        session, 
-                        item['app_ads_txt_url'], 
-                        search_lines, 
-                        item['bundle_id'], 
-                        item['platform']
-                    )
-                    tasks.append(task)
-                
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                for result in batch_results:
-                    if isinstance(result, dict):
+
+        if unique_urls:
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=self.verification_workers,
+                ttl_dns_cache=300,
+                use_dns_cache=True
+            )
+            semaphore = asyncio.Semaphore(self.verification_workers)
+
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async def check_url(url):
+                    # bundle_id/platform are placeholders here; the line-match
+                    # result depends only on the URL content, so we fan out after.
+                    async with semaphore:
+                        return url, await self.verify_ads_txt_detailed(
+                            session, url, search_lines, bundle_id='', platform=''
+                        )
+
+                tasks = [check_url(url) for url in unique_urls]
+                completed = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for outcome in completed:
+                    if isinstance(outcome, Exception):
+                        logger.error(f"Verification task failed: {outcome}")
+                        continue
+                    url, url_result = outcome
+
+                    # Fan the per-URL result out to each app sharing this URL
+                    for app in url_to_apps[url]:
+                        result = dict(url_result)
+                        result['bundle_id'] = app['bundle_id']
+                        result['platform'] = app['platform']
+                        result['app_ads_txt_url'] = url
                         verified_results.append(result)
-                        
-                        # Update stats
+
+                        # Update stats per app (preserves prior reporting semantics)
                         if result['verification_status'] == 'accessible':
                             self.verification_stats['accessible'] += 1
                             if result['has_all_lines'] == 'TRUE':
@@ -492,15 +682,13 @@ class CompleteAdsTxtAnalyzer:
                                 self.verification_stats['missing_some_lines'] += 1
                         else:
                             self.verification_stats['inaccessible'] += 1
-                
-                logger.info(f"Verification batch {i//batch_size + 1}: {len(batch)} URLs processed")
-        
+
         # Add failed extractions as well (with all FALSE values)
         failed_extractions = [
-            result for result in extracted_results 
+            result for result in extracted_results
             if result.get('status') != 'success' or not result.get('app_ads_txt_url')
         ]
-        
+
         for failed in failed_extractions:
             result = {
                 'bundle_id': failed['bundle_id'],
@@ -508,15 +696,15 @@ class CompleteAdsTxtAnalyzer:
                 'app_ads_txt_url': failed.get('app_ads_txt_url', ''),
                 'verification_status': f'extraction_failed_{failed.get("status", "unknown")}'
             }
-            
+
             # Add all lines as FALSE
             for line in search_lines:
                 result[line] = 'FALSE'
-                
+
             result['total_lines_found'] = 0
             result['has_all_lines'] = 'FALSE'
             verified_results.append(result)
-        
+
         return verified_results
     
     async def run_complete_analysis(self, apps_df, search_lines, user_email="unknown"):
@@ -526,28 +714,94 @@ class CompleteAdsTxtAnalyzer:
         logger.info(f"[{user_email}] Starting Complete App Ads.txt Analysis")
         logger.info(f"[{user_email}] ========================================")
         
-        # Step 1: Load and separate bundle IDs
-        android_bundles, ios_bundles = self.load_bundle_ids_from_df(apps_df)
-        
-        self.scraping_stats['total_apps'] = len(android_bundles) + len(ios_bundles)
-        self.scraping_stats['android_apps'] = len(android_bundles)
-        self.scraping_stats['ios_apps'] = len(ios_bundles)
-        
+        # Step 1: Build per-app records (bundle id + any prefilled URL)
+        records = self.prepare_app_records(apps_df)
+
+        self.scraping_stats['total_apps'] = len(records)
+        self.scraping_stats['android_apps'] = sum(1 for r in records if r['platform'] == 'android')
+        self.scraping_stats['ios_apps'] = sum(1 for r in records if r['platform'] == 'iOS')
+
         logger.info(f"[{user_email}] Total apps: {self.scraping_stats['total_apps']:,}")
-        logger.info(f"[{user_email}] Android apps: {len(android_bundles):,}")
-        logger.info(f"[{user_email}] iOS apps: {len(ios_bundles):,}")
-        
-        # Step 2: Extract URLs (parallel processing)
-        logger.info(f"[{user_email}] Phase 1: Extracting Developer Website URLs")
+
+        # Step 2: Resolve each app's URL via the hybrid strategy:
+        #   1) URL prefilled in the upload, else
+        #   2) server-side prefetched metadata lookup, else
+        #   3) checkpoint of previously discovered URLs, else
+        #      (known-dead in checkpoint -> skip discovery entirely), else
+        #   4) discover by scraping the app store (Phase 1).
+        metadata = load_metadata_lookup()
+        checkpoint = CheckpointStore().load()
+
+        resolved_results = []          # already have a URL -> skip discovery
+        terminal_failures = []         # known-dead in checkpoint -> skip discovery
+        bundles_to_discover = []       # records needing store scraping
+        from_upload = from_metadata = from_checkpoint = skipped_dead = 0
+
+        for rec in records:
+            bid = rec['bundle_id']
+            url = rec['app_ads_txt_url']
+            if url:
+                from_upload += 1
+            elif bid in metadata:
+                url = metadata[bid]
+                from_metadata += 1
+            else:
+                cp = checkpoint.get(bid)
+                if cp and cp['status'] == _RESOLVED and cp['app_ads_txt_url']:
+                    url = cp['app_ads_txt_url']
+                    from_checkpoint += 1
+                elif cp and cp['status'] == _DEAD:
+                    # Previously exhausted/terminal -> don't waste a request.
+                    skipped_dead += 1
+                    terminal_failures.append({
+                        'bundle_id': bid,
+                        'platform': rec['platform'],
+                        'app_ads_txt_url': '',
+                        'status': cp.get('reason') or 'dead',
+                    })
+                    continue
+                # else: retryable failure or never seen -> fall through to discovery
+
+            if url:
+                resolved_results.append({
+                    'bundle_id': bid,
+                    'platform': rec['platform'],
+                    'app_ads_txt_url': url,
+                    'status': 'success',
+                })
+            else:
+                bundles_to_discover.append(rec)
+
+        logger.info(f"[{user_email}] URL resolution: {from_upload:,} upload, "
+                    f"{from_metadata:,} metadata, {from_checkpoint:,} checkpoint, "
+                    f"{skipped_dead:,} skipped (known-dead), {len(bundles_to_discover):,} need discovery")
+
+        # Step 3: Discover URLs only for the leftover apps (Phase 1)
+        logger.info(f"[{user_email}] Phase 1: Discovering Developer Website URLs (for {len(bundles_to_discover):,} apps)")
         logger.info(f"[{user_email}] ----------------------------------------")
-        
-        # Run Android and iOS extraction in parallel
+
+        android_bundles = [r['bundle_id'] for r in bundles_to_discover if r['platform'] == 'android']
+        ios_bundles = [r['bundle_id'] for r in bundles_to_discover if r['platform'] == 'iOS']
+        n_android_discover = len(android_bundles)
+        n_ios_discover = len(ios_bundles)
+
         android_task = asyncio.create_task(self.extract_android_urls(android_bundles))
         ios_task = asyncio.create_task(self.extract_ios_urls(ios_bundles))
 
         android_results, ios_results = await asyncio.gather(android_task, ios_task)
-        all_extraction_results = android_results + ios_results
-        
+        discovery_results = android_results + ios_results
+
+        # Record discovery outcomes to the checkpoint so future runs skip
+        # resolved/dead apps and retry only transient failures.
+        for r in discovery_results:
+            if r['status'] == 'success' and r.get('app_ads_txt_url'):
+                checkpoint.record_success(r['bundle_id'], r['app_ads_txt_url'])
+            else:
+                checkpoint.record_failure(r['bundle_id'], r['status'])
+        checkpoint.save()
+
+        all_extraction_results = resolved_results + terminal_failures + discovery_results
+
         # Step 3: Verify ads.txt files
         logger.info(f"[{user_email}] Phase 2: Verifying App-Ads.txt Files")
         logger.info(f"[{user_email}] ----------------------------------------")
@@ -556,11 +810,14 @@ class CompleteAdsTxtAnalyzer:
         
         # Step 4: Log final statistics
         elapsed_time = time.time() - start_time
+        resolved_without_discovery = from_upload + from_metadata
         logger.info(f"[{user_email}] Processing complete!")
         logger.info(f"[{user_email}] Total time: {elapsed_time:.2f}s")
-        logger.info(f"[{user_email}] Android success: {self.scraping_stats['android_success']}/{self.scraping_stats['android_apps']}")
-        logger.info(f"[{user_email}] iOS success: {self.scraping_stats['ios_success']}/{self.scraping_stats['ios_apps']}")
-        logger.info(f"[{user_email}] URLs verified: {self.verification_stats['accessible']}/{self.verification_stats['total_urls']}")
+        logger.info(f"[{user_email}] URLs resolved without discovery: {resolved_without_discovery:,}/{len(records):,} "
+                    f"({from_upload:,} upload, {from_metadata:,} metadata)")
+        logger.info(f"[{user_email}] Discovery (scraped): Android {self.scraping_stats['android_success']}/{n_android_discover}, "
+                    f"iOS {self.scraping_stats['ios_success']}/{n_ios_discover}")
+        logger.info(f"[{user_email}] URLs verified accessible: {self.verification_stats['accessible']}/{self.verification_stats['total_urls']}")
         
         return verified_results
 
@@ -625,6 +882,45 @@ def load_lines_from_memory(file_content):
         if line and not line.startswith('#') and not line.startswith('//'):
             lines.append(line)
     return lines
+
+
+class AppsCsvError(ValueError):
+    """Raised when an uploaded apps CSV can't be used (e.g. no bundle column)."""
+
+
+def load_apps_df_from_content(csv_content):
+    """Parse an uploaded apps CSV robustly so a malformed file never crashes the
+    request. Skips unparseable rows, validates the bundle column exists, and
+    normalizes the app-ads.txt URL column (whitespace + doubled suffix).
+
+    Raises AppsCsvError with a user-friendly message on unrecoverable input."""
+    try:
+        df = pd.read_csv(io.StringIO(csv_content), dtype=str, on_bad_lines='skip')
+    except Exception as e:
+        raise AppsCsvError(f"Could not parse the apps CSV: {e}")
+
+    if df.empty:
+        raise AppsCsvError("The apps CSV is empty.")
+
+    bundle_col = _find_column(df.columns, must_contain=('bundle', 'id'))
+    if not bundle_col:
+        raise AppsCsvError(
+            f"No 'Bundle ID' column found. Columns seen: {list(df.columns)}"
+        )
+
+    # Drop rows with no bundle id
+    df[bundle_col] = df[bundle_col].astype(str).str.strip()
+    df = df[~df[bundle_col].str.lower().isin(['', 'nan', 'none'])]
+
+    # Normalize the URL column if present
+    url_col = _find_column(df.columns, must_contain=('app', 'ads'))
+    if url_col:
+        df[url_col] = df[url_col].map(normalize_app_ads_url)
+
+    # Drop exact duplicate rows
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    return df
 
 async def process_files_async(apps_df, lines_to_check, user_email="unknown"):
     """
@@ -732,12 +1028,56 @@ def index():
         return redirect(url_for('login'))
     return render_template('index.html')
 
+def _run_job_and_email(apps_df, lines_to_check, user_email):
+    """Background worker: process the upload, build the result CSV, and email it.
+
+    Runs off the request thread so the user is never blocked and a disconnect /
+    refresh / request timeout doesn't lose the result. On any failure, emails the
+    user so a job is never a silent black hole."""
+    job_start = time.time()
+    try:
+        logger.info(f"[{user_email}] Background job started: {len(apps_df)} apps, {len(lines_to_check)} search terms")
+
+        results_df = asyncio.run(process_files_async(apps_df, lines_to_check, user_email))
+
+        # Serialize results to CSV bytes in memory
+        buf = io.StringIO()
+        results_df.to_csv(buf, index=False)
+        csv_bytes = buf.getvalue().encode('utf-8')
+
+        # Summary counts for the email body
+        total = len(results_df)
+        accessible = int((results_df['verification_status'] == 'accessible').sum()) if 'verification_status' in results_df.columns else 0
+        matched_all = int((results_df['has_all_lines'] == 'TRUE').sum()) if 'has_all_lines' in results_df.columns else 0
+        counts = {'total': total, 'accessible': accessible, 'matched_all': matched_all}
+
+        base_name = f"results_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+        elapsed = time.time() - job_start
+        logger.info(f"[{user_email}] Background job done in {elapsed:.2f}s: "
+                    f"{total} apps, {accessible} accessible, {matched_all} matched all. "
+                    f"Emailing result ({len(csv_bytes):,} bytes)...")
+
+        if email_sender.send_result_email(user_email, csv_bytes, base_name, counts=counts):
+            logger.info(f"[{user_email}] Result email sent.")
+        else:
+            logger.error(f"[{user_email}] Result email FAILED to send.")
+
+    except Exception as e:
+        logger.error(f"[{user_email}] Background job failed: {e}", exc_info=True)
+        try:
+            email_sender.send_failure_email(user_email, str(e))
+        except Exception as ee:
+            logger.error(f"[{user_email}] Failure email also failed: {ee}")
+
+
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload_files():
-    """Handles file uploads, processes them, and returns the result CSV."""
+    """Accepts the two uploaded files, validates + parses them, then processes
+    in a background thread and emails the result. Returns 202 immediately so the
+    user isn't blocked and a closed/refreshed tab doesn't lose the result."""
     user_email = session.get('user', {}).get('email', 'unknown')
-    
+
     if 'apps_file' not in request.files or 'lines_file' not in request.files:
         logger.warning(f"[{user_email}] Upload failed: Missing files in request")
         return "Missing file(s) in the form submission.", 400
@@ -750,89 +1090,43 @@ def upload_files():
         return "No selected file.", 400
 
     try:
-        # Start timing the entire upload-to-download process
-        upload_start_time = time.time()
-        
-        process = psutil.Process(os_module.getpid())
-        upload_start_memory = process.memory_info().rss / 1024 / 1024  # MB
-        logger.info(f"[{user_email}] Files uploaded: apps={apps_file.filename}, lines={lines_file.filename} | Memory: {upload_start_memory:.2f} MB")
-        
+        logger.info(f"[{user_email}] Files uploaded: apps={apps_file.filename}, lines={lines_file.filename}")
+
         # Read file contents into memory
         apps_csv_content = apps_file.stream.read().decode("utf-8")
         lines_txt_content = lines_file.stream.read().decode("utf-8")
-        print(f"DEBUG: CSV content length: {len(apps_csv_content)}", flush=True)
 
-        # Load data using pandas and our custom function
-        apps_df = pd.read_csv(io.StringIO(apps_csv_content))
-        print(f"DEBUG: Loaded CSV, columns: {list(apps_df.columns)}, shape: {apps_df.shape}", flush=True)
-        logger.info(f"[{user_email}] Files parsed: {len(apps_df)} apps, columns={list(apps_df.columns)}")
+        # Robustly parse the apps CSV (skips bad rows, normalizes URLs).
+        # Raises AppsCsvError -> 400 for unrecoverable input.
+        try:
+            apps_df = load_apps_df_from_content(apps_csv_content)
+        except AppsCsvError as ce:
+            logger.warning(f"[{user_email}] Invalid apps CSV: {ce}")
+            return f"Invalid apps CSV: {ce}", 400
+
         lines_to_check = load_lines_from_memory(lines_txt_content)
-        
-        # Check if AppAdsURL column exists
-        has_url_column = 'AppAdsURL' in apps_df.columns or any('app' in col.lower() and 'ads' in col.lower() for col in apps_df.columns)
-        if not has_url_column:
-            logger.info(f"[{user_email}] No AppAdsURL column found - will auto-discover URLs from app stores (slower)")
-        else:
-            urls_provided = apps_df['AppAdsURL'].notna().sum()
-            logger.info(f"[{user_email}] AppAdsURL column found: {urls_provided}/{len(apps_df)} apps have URLs pre-filled")
-        
-        logger.info(f"[{user_email}] Files parsed: {len(apps_df)} apps, {len(lines_to_check)} search terms")
+        if not lines_to_check:
+            return "The 'lines to check' file is empty.", 400
 
-        # Run the async processing and get the results DataFrame
-        start_time = time.time()
-        process = psutil.Process(os_module.getpid())
-        start_memory = process.memory_info().rss / 1024 / 1024  # MB
-        
-        results_df = asyncio.run(process_files_async(apps_df, lines_to_check, user_email))
-        
-        elapsed_time = time.time() - start_time
-        end_memory = process.memory_info().rss / 1024 / 1024  # MB
-        
-        logger.info(f"[{user_email}] Processing completed in {elapsed_time:.2f}s")
-        logger.info(f"[{user_email}] Upload endpoint memory: Start {start_memory:.2f} MB, End {end_memory:.2f} MB")
-        
-        # Save the results DataFrame to an in-memory buffer
-        output_buffer = io.StringIO()
-        results_df.to_csv(output_buffer, index=False)
-        output_buffer.seek(0)
-        
-        # Create an in-memory bytes buffer to send the file
-        mem_file = io.BytesIO()
-        mem_file.write(output_buffer.getvalue().encode('utf-8'))
-        mem_file.seek(0)
-        
-        # Create a dynamic filename with the current timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        dynamic_filename = f"results_{timestamp}.csv"
-        
-        # Count matches for logging (new structure uses 'verification_status' and 'has_all_lines')
-        accessible_count = (results_df['verification_status'] == 'accessible').sum() if 'verification_status' in results_df.columns else 0
-        all_lines_count = (results_df['has_all_lines'] == 'TRUE').sum() if 'has_all_lines' in results_df.columns else 0
-        upload_end_memory = process.memory_info().rss / 1024 / 1024  # MB
-        
-        # Calculate total time from upload to final response
-        total_elapsed_time = time.time() - upload_start_time
-        
-        logger.info(f"[{user_email}] Results: {accessible_count}/{len(results_df)} apps had accessible app-ads.txt files")
-        logger.info(f"[{user_email}] Results: {all_lines_count}/{len(results_df)} apps matched all search lines")
-        logger.info(f"[{user_email}] Total processing time (upload to final): {total_elapsed_time:.2f}s")
-        logger.info(f"[{user_email}] Sending file: {dynamic_filename} | Final memory: {upload_end_memory:.2f} MB")
+        url_col = _find_column(apps_df.columns, must_contain=('app', 'ads'))
+        if url_col:
+            urls_provided = (apps_df[url_col].astype(str).str.strip() != '').sum()
+            logger.info(f"[{user_email}] AppAdsURL column: {urls_provided}/{len(apps_df)} pre-filled")
+        logger.info(f"[{user_email}] Accepted upload: {len(apps_df)} apps, {len(lines_to_check)} search terms")
 
-        # Create response with download cookie
-        response = make_response(send_file(
-            mem_file,
-            as_attachment=True,
-            download_name=dynamic_filename,
-            mimetype='text/csv'
-        ))
-        
-        # Set cookie to signal download has started
-        response.set_cookie('download_started', 'true', max_age=10)
-        
-        return response
+        # Hand off to a background thread and respond immediately.
+        threading.Thread(
+            target=_run_job_and_email,
+            args=(apps_df, lines_to_check, user_email),
+            daemon=True,
+        ).start()
+
+        msg = (f"Your file was accepted and is being processed. "
+               f"Results will be emailed to {user_email} when ready — you can close this page.")
+        return msg, 202
 
     except Exception as e:
-        logger.error(f"[{user_email}] Upload processing failed: {str(e)}", exc_info=True)
+        logger.error(f"[{user_email}] Upload acceptance failed: {str(e)}", exc_info=True)
         return f"An error occurred: {e}", 500
 
 if __name__ == '__main__':

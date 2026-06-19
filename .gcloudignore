@@ -11,3 +11,6 @@ flask_session/
 example_apps.csv
 apps_to_check.csv
 lines_to_check.txt
+checkpoint.csv
+checkpoint.csv.tmp
+example_apps.raw.csv

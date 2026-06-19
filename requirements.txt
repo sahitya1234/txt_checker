@@ -8,4 +8,6 @@ authlib
 flask-session
 python-dotenv
 openpyxl
-psutil
+google-api-python-client
+google-auth
+google-auth-oauthlib
