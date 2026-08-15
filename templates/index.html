@@ -60,13 +60,35 @@
                             <li>✓ CSV export results</li>
                         </ul>
                     </div>
-                    <button onclick="switchTool('checker')" 
+                    <button onclick="launchTool('tool-panel')"
                             class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold py-3 rounded-lg hover:from-blue-700 hover:to-cyan-700 transition duration-200">
                         Launch Tool →
                     </button>
                 </div>
 
-                <!-- Product 2: Coming Soon -->
+                <!-- Product 2: Active Tool -->
+                <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl hover:shadow-2xl transition duration-300">
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-green-600 rounded-t-2xl"></div>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-2xl font-bold text-white">Domain Ads.txt Checker</h2>
+                        <span class="bg-green-500 text-white text-xs font-bold px-3 py-1 rounded-full">Active</span>
+                    </div>
+                    <p class="text-gray-300 mb-6">Validate ads.txt files directly against website/publisher domains. No app store lookup - checks exactly the domain or URL you give it.</p>
+                    <div class="mb-6">
+                        <p class="text-sm text-gray-400 mb-2">Features:</p>
+                        <ul class="text-sm text-gray-300 space-y-1">
+                            <li>✓ Direct domain checks, no scraping</li>
+                            <li>✓ Domain or Bundle ID column, either works</li>
+                            <li>✓ CSV export results</li>
+                        </ul>
+                    </div>
+                    <button onclick="launchTool('tool-panel-domain')"
+                            class="w-full bg-gradient-to-r from-emerald-500 to-green-600 text-white font-bold py-3 rounded-lg hover:from-emerald-600 hover:to-green-700 transition duration-200">
+                        Launch Tool →
+                    </button>
+                </div>
+
+                <!-- Product 3: Coming Soon -->
                 <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl opacity-75">
                     <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-purple-500 to-pink-500 rounded-t-2xl"></div>
                     <div class="flex items-center justify-between mb-4">
@@ -87,7 +109,7 @@
                     </button>
                 </div>
 
-                <!-- Product 3: Coming Soon -->
+                <!-- Product 4: Coming Soon -->
                 <div class="relative bg-white bg-opacity-5 backdrop-blur-md rounded-2xl p-8 border border-white border-opacity-10 shadow-xl opacity-75">
                     <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-teal-500 rounded-t-2xl"></div>
                     <div class="flex items-center justify-between mb-4">
@@ -109,11 +131,11 @@
                 </div>
             </div>
 
-            <!-- Tool Panel (Hidden by default, shows when tool selected) -->
-            <div id="tool-panel" class="hidden bg-white rounded-2xl shadow-2xl p-8 max-w-2xl mx-auto">
-                <button onclick="closeTool()" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+            <!-- Tool Panel: Bundle ID Checker (Hidden by default, shows when tool selected) -->
+            <div id="tool-panel" class="hidden bg-white rounded-2xl shadow-2xl p-8 max-w-2xl mx-auto mb-8">
+                <button onclick="closeToolPanel('tool-panel', 'upload-form', 'submit-btn', 'loading-message-bundle')" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
                 <h2 class="text-3xl font-bold text-gray-800 mb-6">App Ads.txt Checker</h2>
-                
+
                 <!-- Sample Format Reference Button -->
                 <button type="button" onclick="showSampleModal()" class="w-full mb-6 bg-blue-50 border-2 border-blue-300 text-blue-700 font-semibold py-3 px-4 rounded-lg hover:bg-blue-100 transition flex items-center justify-center gap-2">
                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
@@ -121,7 +143,7 @@
                     </svg>
                     View Sample File Formats
                 </button>
-                
+
                 <form action="/upload" method="post" enctype="multipart/form-data" id="upload-form">
                     <div class="mb-4">
                         <label for="apps_file" class="block text-gray-700 text-sm font-semibold mb-2">1. Upload Apps to Check (.csv)</label>
@@ -138,7 +160,42 @@
                         Process Files and Download Results
                     </button>
                 </form>
-                <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
+                <div id="loading-message-bundle" class="hidden mt-4 text-center text-gray-600">
+                    <p>Processing... This may take a few moments. Your download will start automatically.</p>
+                </div>
+            </div>
+
+            <!-- Tool Panel: Domain Checker (Hidden by default, shows when tool selected) -->
+            <div id="tool-panel-domain" class="hidden bg-white rounded-2xl shadow-2xl p-8 max-w-2xl mx-auto mb-8">
+                <button onclick="closeToolPanel('tool-panel-domain', 'upload-form-domain', 'submit-btn-domain', 'loading-message-domain')" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+                <h2 class="text-3xl font-bold text-gray-800 mb-6">Domain Ads.txt Checker</h2>
+
+                <!-- Sample Format Reference Button -->
+                <button type="button" onclick="showSampleModal()" class="w-full mb-6 bg-green-50 border-2 border-green-300 text-green-700 font-semibold py-3 px-4 rounded-lg hover:bg-green-100 transition flex items-center justify-center gap-2">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M18 5v8a2 2 0 01-2 2h-5l-5 4v-4H4a2 2 0 01-2-2V5a2 2 0 012-2h12a2 2 0 012 2zm-11-1H7a1 1 0 000 2h.01a1 1 0 100-2zM17 7a1 1 0 100-2h-.01a1 1 0 000 2zm-3 2H9a1 1 0 000 2h5a1 1 0 000-2z" clip-rule="evenodd"></path>
+                    </svg>
+                    View Sample File Formats
+                </button>
+
+                <form action="/upload_domains" method="post" enctype="multipart/form-data" id="upload-form-domain">
+                    <div class="mb-4">
+                        <label for="domains_file" class="block text-gray-700 text-sm font-semibold mb-2">1. Upload Domains to Check (.csv)</label>
+                        <input type="file" name="domains_file" id="domains_file" accept=".csv" required
+                               class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg text-gray-700 focus:outline-none focus:border-green-500 transition">
+                        <p class="text-xs text-gray-500 mt-2">Identifier column can be named <strong>Domain</strong> or <strong>Bundle ID</strong> - either works.</p>
+                    </div>
+                    <div class="mb-6">
+                        <label for="lines_file_domain" class="block text-gray-700 text-sm font-semibold mb-2">2. Upload Lines to Check (.txt)</label>
+                        <input type="file" name="lines_file" id="lines_file_domain" accept=".txt" required
+                               class="w-full px-4 py-3 border-2 border-gray-300 rounded-lg text-gray-700 focus:outline-none focus:border-green-500 transition">
+                    </div>
+                    <button type="submit" id="submit-btn-domain"
+                            class="w-full bg-gradient-to-r from-emerald-500 to-green-600 text-white font-bold py-3 px-4 rounded-lg hover:from-emerald-600 hover:to-green-700 transition duration-300">
+                        Process Files and Download Results
+                    </button>
+                </form>
+                <div id="loading-message-domain" class="hidden mt-4 text-center text-gray-600">
                     <p>Processing... This may take a few moments. Your download will start automatically.</p>
                 </div>
             </div>
@@ -187,7 +244,7 @@
                                 <svg class="w-6 h-6 text-orange-500" fill="currentColor" viewBox="0 0 20 20">
                                     <path d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm0 2h12v10H4V5z"></path>
                                 </svg>
-                                <h4 class="text-xl font-bold text-gray-800">Apps CSV File Format</h4>
+                                <h4 class="text-xl font-bold text-gray-800">Bundle ID CSV File Format</h4>
                             </div>
                             <p class="text-sm text-gray-600 mb-3">Create a CSV file with two columns: <strong>Bundle ID</strong> and <strong>AppAdsURL</strong></p>
                             <div class="bg-gray-100 border-l-4 border-orange-500 p-4 rounded font-mono text-sm overflow-x-auto">
@@ -200,9 +257,27 @@ com.netflix.mediaclient,
 com.whatsapp,
 com.telegram,https://telegram.org/app-ads.txt</pre>
                             </div>
-                            <p class="text-xs text-gray-500 mt-2">✓ Bundle ID is required | ✓ AppAdsURL is optional (can be left blank)</p>
+                            <p class="text-xs text-gray-500 mt-2">✓ Bundle ID is required | ✓ AppAdsURL is optional (can be left blank) | ✓ If AppAdsURL is blank, the app store is scraped to discover it</p>
                         </div>
-                        
+
+                        <!-- Sample Domain CSV -->
+                        <div>
+                            <div class="flex items-center gap-2 mb-3">
+                                <svg class="w-6 h-6 text-green-500" fill="currentColor" viewBox="0 0 20 20">
+                                    <path fill-rule="evenodd" d="M4.083 9h1.946c.089-1.546.383-2.97.837-4.118A6.004 6.004 0 004.083 9zM10 2a8 8 0 100 16 8 8 0 000-16zm0 2c-.076 0-.232.032-.465.262-.238.234-.497.623-.737 1.182-.389.907-.673 2.142-.766 3.556h3.936c-.093-1.414-.377-2.649-.766-3.556-.24-.559-.499-.948-.737-1.182C10.232 4.032 10.076 4 10 4zm3.971 5c-.089-1.546-.383-2.97-.837-4.118A6.004 6.004 0 0115.917 9h-1.946zm-2.003 2H8.032c.093 1.414.377 2.649.766 3.556.24.559.499.948.737 1.182.233.23.389.262.465.262.076 0 .232-.032.465-.262.238-.234.497-.623.737-1.182.389-.907.673-2.142.766-3.556zm1.166 4.118c.454-1.147.748-2.572.837-4.118h1.946a6.004 6.004 0 01-2.783 4.118zm-6.268 0C6.412 13.97 6.118 12.546 6.03 11H4.083a6.004 6.004 0 002.783 4.118z" clip-rule="evenodd"></path>
+                                </svg>
+                                <h4 class="text-xl font-bold text-gray-800">Domain CSV File Format</h4>
+                            </div>
+                            <p class="text-sm text-gray-600 mb-3">Create a CSV file with an identifier column named either <strong>Domain</strong> or <strong>Bundle ID</strong> (both work - no need to rename your sheet), and an optional <strong>AppAdsURL</strong> column. Checks the value directly - no app store lookup involved.</p>
+                            <div class="bg-gray-100 border-l-4 border-green-500 p-4 rounded font-mono text-sm overflow-x-auto">
+                                <pre>Domain,AppAdsURL
+example.com,
+chathispano.com,
+custom-site.com,https://custom-site.com/special-ads.txt</pre>
+                            </div>
+                            <p class="text-xs text-gray-500 mt-2">✓ Domain or Bundle ID column is required (either name works) | ✓ AppAdsURL is optional | ✓ If AppAdsURL is blank, &lt;value&gt;/ads.txt is checked by default | ✓ If AppAdsURL is filled in, it's used exactly as given</p>
+                        </div>
+
                         <!-- Sample TXT -->
                         <div>
                             <div class="flex items-center gap-2 mb-3">
@@ -240,21 +315,25 @@ bidstack.com</pre>
     </div>
 
     <script>
-        function switchTool(toolName) {
-            document.getElementById('tool-panel').classList.remove('hidden');
+        function launchTool(panelId) {
+            document.getElementById(panelId).classList.remove('hidden');
             // Smooth scroll to tool panel
             setTimeout(() => {
-                document.getElementById('tool-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                document.getElementById(panelId).scrollIntoView({ behavior: 'smooth', block: 'start' });
             }, 100);
         }
 
-        function closeTool() {
-            document.getElementById('tool-panel').classList.add('hidden');
-            document.getElementById('upload-form').reset();
-            document.getElementById('loading-message').classList.add('hidden');
+        function resetForm(formId, submitBtnId) {
+            document.getElementById(formId).reset();
+            document.getElementById(submitBtnId).disabled = false;
+            document.getElementById(submitBtnId).innerText = 'Process Files and Download Results';
+        }
+
+        function closeToolPanel(panelId, formId, submitBtnId, loadingMsgId) {
+            document.getElementById(panelId).classList.add('hidden');
+            resetForm(formId, submitBtnId);
+            document.getElementById(loadingMsgId).classList.add('hidden');
             document.getElementById('loading-overlay').classList.add('hidden');
-            document.getElementById('submit-btn').disabled = false;
-            document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
         }
 
         function showSampleModal() {
@@ -320,56 +399,59 @@ bidstack.com</pre>
             }, 1500);
         }
 
-        document.getElementById('upload-form').addEventListener('submit', function(e) {
-            // Show loader immediately
-            showLoader();
-            
-            document.getElementById('submit-btn').disabled = true;
-            document.getElementById('submit-btn').innerText = 'Processing...';
-            document.getElementById('loading-message').classList.remove('hidden');
+        function attachFormHandler(formId, submitBtnId, loadingMsgId) {
+            document.getElementById(formId).addEventListener('submit', function(e) {
+                // Show loader immediately
+                showLoader();
 
-            // Set a unique cookie value before submission
-            const downloadToken = new Date().getTime();
-            document.cookie = 'downloadToken=' + downloadToken + '; path=/';
-            
-            // Poll for download completion by checking if server set the cookie
-            let attempts = 0;
-            const maxAttempts = 1200; // 10 minutes (1200 * 500ms = 600s)
-            
-            const checkDownloadInterval = setInterval(function() {
-                attempts++;
-                
-                // Check if download cookie was set by server
-                const cookies = document.cookie.split(';');
-                let downloadStarted = false;
-                
-                for (let cookie of cookies) {
-                    if (cookie.trim().startsWith('download_started=')) {
-                        downloadStarted = true;
-                        break;
+                document.getElementById(submitBtnId).disabled = true;
+                document.getElementById(submitBtnId).innerText = 'Processing...';
+                document.getElementById(loadingMsgId).classList.remove('hidden');
+
+                // Set a unique cookie value before submission
+                const downloadToken = new Date().getTime();
+                document.cookie = 'downloadToken=' + downloadToken + '; path=/';
+
+                // Poll for download completion by checking if server set the cookie
+                let attempts = 0;
+                const maxAttempts = 1200; // 10 minutes (1200 * 500ms = 600s)
+
+                const checkDownloadInterval = setInterval(function() {
+                    attempts++;
+
+                    // Check if download cookie was set by server
+                    const cookies = document.cookie.split(';');
+                    let downloadStarted = false;
+
+                    for (let cookie of cookies) {
+                        if (cookie.trim().startsWith('download_started=')) {
+                            downloadStarted = true;
+                            break;
+                        }
                     }
-                }
-                
-                // If download started or max attempts reached
-                if (downloadStarted || attempts >= maxAttempts) {
-                    clearInterval(checkDownloadInterval);
-                    
-                    // Clean up the cookie
-                    document.cookie = 'download_started=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-                    
-                    // Hide loader
-                    hideLoader();
-                    
-                    // Reset form
-                    setTimeout(function() {
-                        document.getElementById('submit-btn').disabled = false;
-                        document.getElementById('submit-btn').innerText = 'Process Files and Download Results';
-                        document.getElementById('loading-message').classList.add('hidden');
-                        document.getElementById('upload-form').reset();
-                    }, 1500);
-                }
-            }, 500); // Check every 500ms
-        });
+
+                    // If download started or max attempts reached
+                    if (downloadStarted || attempts >= maxAttempts) {
+                        clearInterval(checkDownloadInterval);
+
+                        // Clean up the cookie
+                        document.cookie = 'download_started=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
+
+                        // Hide loader
+                        hideLoader();
+
+                        // Reset form
+                        setTimeout(function() {
+                            resetForm(formId, submitBtnId);
+                            document.getElementById(loadingMsgId).classList.add('hidden');
+                        }, 1500);
+                    }
+                }, 500); // Check every 500ms
+            });
+        }
+
+        attachFormHandler('upload-form', 'submit-btn', 'loading-message-bundle');
+        attachFormHandler('upload-form-domain', 'submit-btn-domain', 'loading-message-domain');
     </script>
 </body>
 </html>

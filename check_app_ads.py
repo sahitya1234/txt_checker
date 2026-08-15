@@ -73,40 +73,171 @@ class CompleteAdsTxtAnalyzer:
         self.android_regions = ['us', 'gb', 'ca', 'au', 'in']
     
     def load_bundle_ids_from_df(self, apps_df):
-        """Load and separate bundle IDs by platform from a DataFrame"""
+        """Load and separate bundle IDs by platform from a DataFrame.
+
+        Rows that already have a non-empty AppAdsURL are pulled out separately
+        so they can skip store discovery/scraping and go straight to verification.
+        """
         try:
             android_bundles = []
             ios_bundles = []
-            
+            prefilled_results = []
+
             # Normalize column names
+            bundle_column = None
             for col in apps_df.columns:
                 lower_col = col.lower().strip()
                 if 'bundle' in lower_col and 'id' in lower_col:
                     bundle_column = col
                     break
-            else:
+
+            if bundle_column is None:
                 logger.error("No bundle ID column found in DataFrame")
-                return [], []
-            
-            logger.info(f"Using column: '{bundle_column}'")
-            
+                return [], [], []
+
+            url_column = None
+            for col in apps_df.columns:
+                lower_col = col.lower().strip()
+                if 'app' in lower_col and 'ads' in lower_col:
+                    url_column = col
+                    break
+
+            logger.info(f"Using column: '{bundle_column}'" + (f", URL column: '{url_column}'" if url_column else ""))
+
             for _, row in apps_df.iterrows():
                 bundle_id = str(row.get(bundle_column, '')).strip()
-                if bundle_id and bundle_id.lower() not in ['', 'nan', 'none']:
-                    if bundle_id.isdigit():
-                        ios_bundles.append(bundle_id)
-                    else:
-                        android_bundles.append(bundle_id)
-            
+                if not bundle_id or bundle_id.lower() in ['', 'nan', 'none']:
+                    continue
+
+                platform = 'iOS' if bundle_id.isdigit() else 'android'
+
+                provided_url = None
+                if url_column is not None:
+                    raw_url = row.get(url_column, '')
+                    raw_url = str(raw_url).strip() if pd.notna(raw_url) else ''
+                    if raw_url and raw_url.lower() != 'nan':
+                        provided_url = raw_url
+
+                if provided_url:
+                    prefilled_results.append({
+                        'bundle_id': bundle_id,
+                        'platform': platform,
+                        'app_ads_txt_url': provided_url,
+                        'status': 'success'
+                    })
+                elif platform == 'iOS':
+                    ios_bundles.append(bundle_id)
+                else:
+                    android_bundles.append(bundle_id)
+
             logger.info(f"Loaded bundle IDs from DataFrame")
-            logger.info(f"Distribution: Android: {len(android_bundles):,} | iOS: {len(ios_bundles):,}")
-            
-            return android_bundles, ios_bundles
-            
+            logger.info(
+                f"Distribution: Android: {len(android_bundles):,} | iOS: {len(ios_bundles):,} | "
+                f"Pre-filled URLs (discovery skipped): {len(prefilled_results):,}"
+            )
+
+            return android_bundles, ios_bundles, prefilled_results
+
         except Exception as e:
             logger.error(f"Error loading bundle IDs: {e}")
-            return [], []
-    
+            return [], [], []
+
+    @staticmethod
+    def normalize_domain_url(raw_value, default_filename='ads.txt'):
+        """Turn a raw Domain or URL cell into a clean, fetchable URL.
+
+        Preserves an explicitly-typed scheme (e.g. http://) instead of
+        forcing https. If the value already has a path beyond the bare
+        host (e.g. a full URL to a specific ads.txt/app-ads.txt location),
+        it's used as-is; only a bare host gets the default filename appended.
+        """
+        if not raw_value or not isinstance(raw_value, str):
+            return ''
+        v = raw_value.strip()
+        if not v or v.lower() in ('nan', 'none'):
+            return ''
+        if not re.match(r'^https?://', v, re.IGNORECASE):
+            v = f'https://{v}'
+        v = v.rstrip('/')
+        without_scheme = re.sub(r'^https?://', '', v, flags=re.IGNORECASE)
+        if '/' in without_scheme:
+            return v
+        return f'{v}/{default_filename}'
+
+    def load_domains_from_df(self, domains_df):
+        """Build ready-to-verify result dicts directly from a domain-checker DataFrame.
+
+        No store scraping - rows already carry (or can trivially derive) their
+        ads.txt URL, so they go straight to verification. The identifier column
+        may be named either "Domain" or "Bundle ID" - the team isn't required
+        to rename their existing sheets to use this tool.
+        """
+        try:
+            results = []
+            skipped = 0
+
+            domain_column = None
+            for col in domains_df.columns:
+                lower_col = col.lower().strip()
+                if 'domain' in lower_col or ('bundle' in lower_col and 'id' in lower_col):
+                    domain_column = col
+                    break
+
+            if domain_column is None:
+                logger.error("No Domain or Bundle ID column found in DataFrame")
+                return []
+
+            url_column = None
+            for col in domains_df.columns:
+                lower_col = col.lower().strip()
+                if 'app' in lower_col and 'ads' in lower_col:
+                    url_column = col
+                    break
+            if url_column is None:
+                for col in domains_df.columns:
+                    lower_col = col.lower().strip()
+                    if 'url' in lower_col and 'domain' not in lower_col:
+                        url_column = col
+                        break
+
+            logger.info(f"Using identifier column: '{domain_column}'" + (f", URL column: '{url_column}'" if url_column else ""))
+
+            for _, row in domains_df.iterrows():
+                domain = str(row.get(domain_column, '')).strip()
+                if domain.lower() in ('nan', 'none'):
+                    domain = ''
+
+                raw_url = ''
+                if url_column is not None:
+                    raw_url = row.get(url_column, '')
+                    raw_url = str(raw_url).strip() if pd.notna(raw_url) else ''
+                    if raw_url.lower() == 'nan':
+                        raw_url = ''
+
+                if not domain and not raw_url:
+                    skipped += 1
+                    continue
+
+                identifier = domain if domain else raw_url
+                final_url = self.normalize_domain_url(raw_url) if raw_url else self.normalize_domain_url(domain)
+                if not final_url:
+                    skipped += 1
+                    continue
+
+                results.append({
+                    'bundle_id': identifier,
+                    'platform': 'domain',
+                    'app_ads_txt_url': final_url,
+                    'status': 'success'
+                })
+
+            logger.info(f"Loaded {len(results):,} domain rows for direct verification (skipped {skipped:,} empty rows)")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error loading domains: {e}")
+            return []
+
     async def scrape_android_app(self, session, bundle_id, max_retries=3):
         """Scrape Android app for developer website URL"""
         for retry_count in range(max_retries + 1):
@@ -526,27 +657,28 @@ class CompleteAdsTxtAnalyzer:
         logger.info(f"[{user_email}] Starting Complete App Ads.txt Analysis")
         logger.info(f"[{user_email}] ========================================")
         
-        # Step 1: Load and separate bundle IDs
-        android_bundles, ios_bundles = self.load_bundle_ids_from_df(apps_df)
-        
-        self.scraping_stats['total_apps'] = len(android_bundles) + len(ios_bundles)
+        # Step 1: Load and separate bundle IDs (rows with a pre-filled AppAdsURL skip discovery)
+        android_bundles, ios_bundles, prefilled_results = self.load_bundle_ids_from_df(apps_df)
+
+        self.scraping_stats['total_apps'] = len(android_bundles) + len(ios_bundles) + len(prefilled_results)
         self.scraping_stats['android_apps'] = len(android_bundles)
         self.scraping_stats['ios_apps'] = len(ios_bundles)
-        
+
         logger.info(f"[{user_email}] Total apps: {self.scraping_stats['total_apps']:,}")
-        logger.info(f"[{user_email}] Android apps: {len(android_bundles):,}")
-        logger.info(f"[{user_email}] iOS apps: {len(ios_bundles):,}")
-        
-        # Step 2: Extract URLs (parallel processing)
+        logger.info(f"[{user_email}] Android apps to discover: {len(android_bundles):,}")
+        logger.info(f"[{user_email}] iOS apps to discover: {len(ios_bundles):,}")
+        logger.info(f"[{user_email}] Apps with pre-filled AppAdsURL (discovery skipped): {len(prefilled_results):,}")
+
+        # Step 2: Extract URLs (parallel processing) for apps that don't already have one
         logger.info(f"[{user_email}] Phase 1: Extracting Developer Website URLs")
         logger.info(f"[{user_email}] ----------------------------------------")
-        
+
         # Run Android and iOS extraction in parallel
         android_task = asyncio.create_task(self.extract_android_urls(android_bundles))
         ios_task = asyncio.create_task(self.extract_ios_urls(ios_bundles))
 
         android_results, ios_results = await asyncio.gather(android_task, ios_task)
-        all_extraction_results = android_results + ios_results
+        all_extraction_results = android_results + ios_results + prefilled_results
         
         # Step 3: Verify ads.txt files
         logger.info(f"[{user_email}] Phase 2: Verifying App-Ads.txt Files")
@@ -562,6 +694,24 @@ class CompleteAdsTxtAnalyzer:
         logger.info(f"[{user_email}] iOS success: {self.scraping_stats['ios_success']}/{self.scraping_stats['ios_apps']}")
         logger.info(f"[{user_email}] URLs verified: {self.verification_stats['accessible']}/{self.verification_stats['total_urls']}")
         
+        return verified_results
+
+    async def run_domain_analysis(self, domains_df, search_lines, user_email="unknown"):
+        """Run analysis directly against a Domain column - no store discovery/scraping."""
+        start_time = time.time()
+
+        logger.info(f"[{user_email}] Starting Domain Ads.txt Analysis")
+        logger.info(f"[{user_email}] ========================================")
+
+        prefilled_results = self.load_domains_from_df(domains_df)
+        self.verification_stats['total_urls'] = len(prefilled_results)
+
+        verified_results = await self.verify_extracted_urls(prefilled_results, search_lines)
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"[{user_email}] Domain analysis complete in {elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] URLs verified: {self.verification_stats['accessible']}/{self.verification_stats['total_urls']}")
+
         return verified_results
 
 # Initialize the Flask application
@@ -647,6 +797,27 @@ async def process_files_async(apps_df, lines_to_check, user_email="unknown"):
     if verified_results:
         df_results = pd.DataFrame(verified_results)
         return df_results
+    else:
+        return pd.DataFrame(verified_results)
+
+async def process_domain_files_async(domains_df, lines_to_check, user_email="unknown"):
+    """
+    Process a Domain-column file directly, with no store discovery/scraping.
+
+    Args:
+        domains_df: DataFrame with a Domain column (and optional URL column)
+        lines_to_check: List of lines to search for in ads.txt files
+        user_email: Email of user for logging
+
+    Returns:
+        DataFrame with verification results
+    """
+    analyzer = CompleteAdsTxtAnalyzer(verification_workers=30)
+
+    verified_results = await analyzer.run_domain_analysis(domains_df, lines_to_check, user_email)
+
+    if verified_results:
+        return pd.DataFrame(verified_results)
     else:
         return pd.DataFrame(verified_results)
 
@@ -833,6 +1004,96 @@ def upload_files():
 
     except Exception as e:
         logger.error(f"[{user_email}] Upload processing failed: {str(e)}", exc_info=True)
+        return f"An error occurred: {e}", 500
+
+@app.route('/upload_domains', methods=['POST'])
+@login_required
+def upload_domains():
+    """Handles domain-file uploads, checks ads.txt directly (no store discovery), returns the result CSV."""
+    user_email = session.get('user', {}).get('email', 'unknown')
+
+    if 'domains_file' not in request.files or 'lines_file' not in request.files:
+        logger.warning(f"[{user_email}] Domain upload failed: Missing files in request")
+        return "Missing file(s) in the form submission.", 400
+
+    domains_file = request.files['domains_file']
+    lines_file = request.files['lines_file']
+
+    if domains_file.filename == '' or lines_file.filename == '':
+        logger.warning(f"[{user_email}] Domain upload failed: Empty filename")
+        return "No selected file.", 400
+
+    try:
+        upload_start_time = time.time()
+
+        process = psutil.Process(os_module.getpid())
+        upload_start_memory = process.memory_info().rss / 1024 / 1024  # MB
+        logger.info(f"[{user_email}] Files uploaded: domains={domains_file.filename}, lines={lines_file.filename} | Memory: {upload_start_memory:.2f} MB")
+
+        domains_csv_content = domains_file.stream.read().decode("utf-8")
+        lines_txt_content = lines_file.stream.read().decode("utf-8")
+
+        domains_df = pd.read_csv(io.StringIO(domains_csv_content))
+        logger.info(f"[{user_email}] Files parsed: {len(domains_df)} rows, columns={list(domains_df.columns)}")
+        lines_to_check = load_lines_from_memory(lines_txt_content)
+
+        has_identifier_column = any(
+            'domain' in col.lower() or ('bundle' in col.lower() and 'id' in col.lower())
+            for col in domains_df.columns
+        )
+        if not has_identifier_column:
+            logger.warning(f"[{user_email}] Domain upload failed: No 'Domain' or 'Bundle ID' column found")
+            return "No 'Domain' or 'Bundle ID' column found in the uploaded CSV.", 400
+
+        logger.info(f"[{user_email}] Files parsed: {len(domains_df)} domains, {len(lines_to_check)} search terms")
+
+        start_time = time.time()
+        process = psutil.Process(os_module.getpid())
+        start_memory = process.memory_info().rss / 1024 / 1024  # MB
+
+        results_df = asyncio.run(process_domain_files_async(domains_df, lines_to_check, user_email))
+
+        elapsed_time = time.time() - start_time
+        end_memory = process.memory_info().rss / 1024 / 1024  # MB
+
+        logger.info(f"[{user_email}] Processing completed in {elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] Upload endpoint memory: Start {start_memory:.2f} MB, End {end_memory:.2f} MB")
+
+        output_buffer = io.StringIO()
+        results_df.to_csv(output_buffer, index=False)
+        output_buffer.seek(0)
+
+        mem_file = io.BytesIO()
+        mem_file.write(output_buffer.getvalue().encode('utf-8'))
+        mem_file.seek(0)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        dynamic_filename = f"domain_results_{timestamp}.csv"
+
+        accessible_count = (results_df['verification_status'] == 'accessible').sum() if 'verification_status' in results_df.columns else 0
+        all_lines_count = (results_df['has_all_lines'] == 'TRUE').sum() if 'has_all_lines' in results_df.columns else 0
+        upload_end_memory = process.memory_info().rss / 1024 / 1024  # MB
+
+        total_elapsed_time = time.time() - upload_start_time
+
+        logger.info(f"[{user_email}] Results: {accessible_count}/{len(results_df)} domains had accessible ads.txt files")
+        logger.info(f"[{user_email}] Results: {all_lines_count}/{len(results_df)} domains matched all search lines")
+        logger.info(f"[{user_email}] Total processing time (upload to final): {total_elapsed_time:.2f}s")
+        logger.info(f"[{user_email}] Sending file: {dynamic_filename} | Final memory: {upload_end_memory:.2f} MB")
+
+        response = make_response(send_file(
+            mem_file,
+            as_attachment=True,
+            download_name=dynamic_filename,
+            mimetype='text/csv'
+        ))
+
+        response.set_cookie('download_started', 'true', max_age=10)
+
+        return response
+
+    except Exception as e:
+        logger.error(f"[{user_email}] Domain upload processing failed: {str(e)}", exc_info=True)
         return f"An error occurred: {e}", 500
 
 if __name__ == '__main__':
