@@ -49,3 +49,11 @@ htmlcov/
 
 # Temporary files
 tmp_test_async.py
+
+# Runtime checkpoint cache (learned discovery outcomes; not source)
+checkpoint.csv
+checkpoint.csv.tmp
+example_apps.raw.csv
+
+# OAuth client secret for Gmail token generation (never commit)
+client_secret.json

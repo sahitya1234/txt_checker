@@ -79,7 +79,7 @@
                         <ul class="text-sm text-gray-300 space-y-1">
                             <li>✓ Direct domain checks, no scraping</li>
                             <li>✓ Domain or Bundle ID column, either works</li>
-                            <li>✓ CSV export results</li>
+                            <li>✓ Results emailed to you</li>
                         </ul>
                     </div>
                     <button onclick="launchTool('tool-panel-domain')"
@@ -133,7 +133,7 @@
 
             <!-- Tool Panel: Bundle ID Checker (Hidden by default, shows when tool selected) -->
             <div id="tool-panel" class="hidden bg-white rounded-2xl shadow-2xl p-8 max-w-2xl mx-auto mb-8">
-                <button onclick="closeToolPanel('tool-panel', 'upload-form', 'submit-btn', 'loading-message-bundle')" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
+                <button onclick="closeToolPanel('tool-panel', 'upload-form', 'submit-btn', 'loading-message')" class="float-right text-gray-500 hover:text-gray-700 text-2xl font-bold">×</button>
                 <h2 class="text-3xl font-bold text-gray-800 mb-6">App Ads.txt Checker</h2>
 
                 <!-- Sample Format Reference Button -->
@@ -157,11 +157,11 @@
                     </div>
                     <button type="submit" id="submit-btn"
                             class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 text-white font-bold py-3 px-4 rounded-lg hover:from-blue-700 hover:to-cyan-700 transition duration-300">
-                        Process Files and Download Results
+                        Process Files (results emailed to you)
                     </button>
                 </form>
-                <div id="loading-message-bundle" class="hidden mt-4 text-center text-gray-600">
-                    <p>Processing... This may take a few moments. Your download will start automatically.</p>
+                <div id="loading-message" class="hidden mt-4 text-center text-gray-600">
+                    <p>Submitting your files…</p>
                 </div>
             </div>
 
@@ -192,11 +192,11 @@
                     </div>
                     <button type="submit" id="submit-btn-domain"
                             class="w-full bg-gradient-to-r from-emerald-500 to-green-600 text-white font-bold py-3 px-4 rounded-lg hover:from-emerald-600 hover:to-green-700 transition duration-300">
-                        Process Files and Download Results
+                        Process Files (results emailed to you)
                     </button>
                 </form>
                 <div id="loading-message-domain" class="hidden mt-4 text-center text-gray-600">
-                    <p>Processing... This may take a few moments. Your download will start automatically.</p>
+                    <p>Submitting your files…</p>
                 </div>
             </div>
 
@@ -257,7 +257,7 @@ com.netflix.mediaclient,
 com.whatsapp,
 com.telegram,https://telegram.org/app-ads.txt</pre>
                             </div>
-                            <p class="text-xs text-gray-500 mt-2">✓ Bundle ID is required | ✓ AppAdsURL is optional (can be left blank) | ✓ If AppAdsURL is blank, the app store is scraped to discover it</p>
+                            <p class="text-xs text-gray-500 mt-2">✓ Bundle ID is required | ✓ AppAdsURL is optional (can be left blank) | ✓ If AppAdsURL is blank, the app store is looked up to discover it</p>
                         </div>
 
                         <!-- Sample Domain CSV -->
@@ -323,17 +323,13 @@ bidstack.com</pre>
             }, 100);
         }
 
-        function resetForm(formId, submitBtnId) {
-            document.getElementById(formId).reset();
-            document.getElementById(submitBtnId).disabled = false;
-            document.getElementById(submitBtnId).innerText = 'Process Files and Download Results';
-        }
-
         function closeToolPanel(panelId, formId, submitBtnId, loadingMsgId) {
             document.getElementById(panelId).classList.add('hidden');
-            resetForm(formId, submitBtnId);
+            document.getElementById(formId).reset();
             document.getElementById(loadingMsgId).classList.add('hidden');
             document.getElementById('loading-overlay').classList.add('hidden');
+            document.getElementById(submitBtnId).disabled = false;
+            document.getElementById(submitBtnId).innerText = 'Process Files (results emailed to you)';
         }
 
         function showSampleModal() {
@@ -399,59 +395,42 @@ bidstack.com</pre>
             }, 1500);
         }
 
-        function attachFormHandler(formId, submitBtnId, loadingMsgId) {
-            document.getElementById(formId).addEventListener('submit', function(e) {
-                // Show loader immediately
-                showLoader();
+        function attachFormHandler(formId, submitBtnId, loadingMsgId, endpoint) {
+            const originalText = 'Process Files (results emailed to you)';
+            document.getElementById(formId).addEventListener('submit', async function(e) {
+                // Process happens in the background and the result is emailed, so we
+                // submit via fetch and show a confirmation instead of downloading.
+                e.preventDefault();
 
-                document.getElementById(submitBtnId).disabled = true;
-                document.getElementById(submitBtnId).innerText = 'Processing...';
-                document.getElementById(loadingMsgId).classList.remove('hidden');
+                const btn = document.getElementById(submitBtnId);
+                const msg = document.getElementById(loadingMsgId);
 
-                // Set a unique cookie value before submission
-                const downloadToken = new Date().getTime();
-                document.cookie = 'downloadToken=' + downloadToken + '; path=/';
+                btn.disabled = true;
+                btn.innerText = 'Submitting...';
+                msg.classList.remove('hidden');
+                msg.innerHTML = '<p>Submitting your files…</p>';
 
-                // Poll for download completion by checking if server set the cookie
-                let attempts = 0;
-                const maxAttempts = 1200; // 10 minutes (1200 * 500ms = 600s)
+                try {
+                    const resp = await fetch(endpoint, { method: 'POST', body: new FormData(e.target) });
+                    const text = await resp.text();
 
-                const checkDownloadInterval = setInterval(function() {
-                    attempts++;
-
-                    // Check if download cookie was set by server
-                    const cookies = document.cookie.split(';');
-                    let downloadStarted = false;
-
-                    for (let cookie of cookies) {
-                        if (cookie.trim().startsWith('download_started=')) {
-                            downloadStarted = true;
-                            break;
-                        }
+                    if (resp.status === 202) {
+                        msg.innerHTML = '<p class="text-green-600 font-semibold">✅ ' + text + '</p>';
+                        e.target.reset();
+                    } else {
+                        msg.innerHTML = '<p class="text-red-600 font-semibold">⚠️ ' + text + '</p>';
                     }
-
-                    // If download started or max attempts reached
-                    if (downloadStarted || attempts >= maxAttempts) {
-                        clearInterval(checkDownloadInterval);
-
-                        // Clean up the cookie
-                        document.cookie = 'download_started=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-
-                        // Hide loader
-                        hideLoader();
-
-                        // Reset form
-                        setTimeout(function() {
-                            resetForm(formId, submitBtnId);
-                            document.getElementById(loadingMsgId).classList.add('hidden');
-                        }, 1500);
-                    }
-                }, 500); // Check every 500ms
+                } catch (err) {
+                    msg.innerHTML = '<p class="text-red-600 font-semibold">⚠️ Network error: ' + err + '</p>';
+                } finally {
+                    btn.disabled = false;
+                    btn.innerText = originalText;
+                }
             });
         }
 
-        attachFormHandler('upload-form', 'submit-btn', 'loading-message-bundle');
-        attachFormHandler('upload-form-domain', 'submit-btn-domain', 'loading-message-domain');
+        attachFormHandler('upload-form', 'submit-btn', 'loading-message', '/upload');
+        attachFormHandler('upload-form-domain', 'submit-btn-domain', 'loading-message-domain', '/upload_domains');
     </script>
 </body>
 </html>
